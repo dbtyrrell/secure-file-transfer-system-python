@@ -1,0 +1,8 @@
+bcrypt
+cryptography
+getpass
+hashlib
+json
+os
+socket
+ssl
