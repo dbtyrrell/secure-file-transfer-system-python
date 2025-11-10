@@ -1,4 +1,4 @@
-# secure-file-transfer-system-python
+# Secure File Transfer System
 
 A Python language program using end-to-end encryption (E2EE) for secure file transfer over untrusted networks with a zero trust architecture (ZTA).
 
@@ -7,14 +7,13 @@ A Python language program using end-to-end encryption (E2EE) for secure file tra
 ### Implemented
 
 - Confidentiality: Encryption with Transport Layer Security (TLS)
+- Availability: Asymmetric key generation using client initiated Certificate Signing Requests (CSR)
 
 ### Pending implementation
 
 - Integrity: 
     - Digitial signing and verification of files
     - SHA-256 checksums
-- Availability: Asymmetric key generation
-
 - Authentication: User registration and password hash management
 - Authorisation: Role-based access control (RBAC) with r|w|x enforcement
 - Accounting: Tamper evident audit logs
@@ -43,7 +42,7 @@ ___
 
 ## Security
 
-- Confidentiality through Asymmetric E2EE
+- Confidentiality through asymmetric E2EE
 - Integrity through hash verification
 - Non-repudiation through digital signatures
 
