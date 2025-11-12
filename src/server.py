@@ -1,6 +1,9 @@
+import bcrypt
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.x509.oid import NameOID
 from datetime import datetime, timedelta
+import json
 import os
 import socket
 import ssl
@@ -8,13 +11,44 @@ import threading
 
 # Global variables
 HOST = "10.16.10.247"
-PORT = 8443
+SFTS_PORT = 8443
+CSR_PORT = 8444
 CERTIFICATES = "/workspaces/secure-file-transfer-system-python/certificates/"
 DIRECTORY = "/workspaces/secure-file-transfer-system-python/directory/"
+USERS = "/workspaces/secure-file-transfer-system-python/src/users.json"
+ROLES = {
+    "admin": {
+        "download" : True,
+        "upload" : True,
+        "delete" : True,
+        "ls" : True
+    },
+    "user": {
+        "download" : True,
+        "upload" : True,
+        "delete" : False,
+        "ls" : True
+    },
+    "registered": {
+        "download" : False,
+        "upload" : False,
+        "delete" : False,
+        "ls" : True
+    },
+    "unregistered": {
+        "download" : False,
+        "upload" : False,
+        "delete" : False,
+        "ls" : False
+    },   
+}
 
-# Create filepaths if required
+# Create required filepaths if they don't already exist
 os.makedirs(CERTIFICATES, exist_ok=True)
 os.makedirs(DIRECTORY, exist_ok=True)
+if not os.path.exists(USERS):
+    with open(USERS, 'w') as file:
+        json.dump({}, file)
 
 # Configure SSL context
 context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -23,124 +57,234 @@ context.load_cert_chain(
     certfile = f"{CERTIFICATES}server_certificate.pem", 
     keyfile = f"{CERTIFICATES}server_key.pem"
 )
-context.load_verify_locations("/workspaces/secure-file-transfer-system-python/certificates/ca_certificate.pem")
+context.load_verify_locations(f"{CERTIFICATES}ca_certificate.pem")
 
-def manage_client(conn):
+def manage_client(ssl_conn, reader, writer):
     """
     This function defines the logic for how the server will manage SSL connections with client 
-    devices, incorporating client initiated Upload, Download, ls and Quit commands.
+    devices, incorporating response logic for client initiated Upload, Download, ls and Quit 
+    commands.
     """
 
-    print("Client connected:", conn.getpeercert())
-    writer = conn.makefile("rwb", buffering=0)
-    writer.write(b"Authentication successful\n")
+    print("Client connection initiated:", ssl_conn.getpeercert())    
+    writer.write(f"Connected to Secure File Transfer System server {HOST}\n".encode())
+
+    # Authenticate user
+    writer.write("Enter username: \n")
+    writer.flush()
+    username = reader.readline().strip()
+    
+    writer.write("Enter password: \n")
+    writer.flush()
+    password = reader.readline().strip()
+
+    role = authenticate_user(username, password)
+
+    # Notify client of unsuccessful authentication and close connection
+    if not role:
+        writer.write("Invalid credentials\n")
+        ssl_conn.close()
+        return
+    
+    # Notify client by providing user role
+    writer.write(f"{role}\n".encode())
+
+    # Initialise user role permissions as a local variable
+    user_permissions = ROLES[role]
 
     try:
         while True:
-            line = conn.makefile("r").readline()
+            line = reader.readline()
             if not line:
                 break
+            
+            # Decomposion of client commands
             args = line.strip().split(maxsplit=1)    
             cmd = args[0].lower()
             filename = args[1] if len(args) > 1 else None
+            # time_sent = args[2] if len(args) > 2 else None      ### PLACEHOLDER ONLY, Replay Attack mitigiation mechanism yet to be added
 
-            # Download command ssl transfer logic
+            # Download command logic for ssl transfer
             if cmd == "download":
-                if not filename:
-                    writer.write(b"Error: Filename not provided\n")
+                
+                if not user_permissions["download"]:
+                    writer.write("Insufficient permissions\n")
                     continue
-                filepath = os.path.join(DIRECTORY, filename)
-                if not os.path.exists(filepath):
-                    writer.write(b"Error: Requested file doesn't exist\n")
-                    continue                
-                with open(filepath, "rb") as file:
-                    for chunk in iter(lambda: file.read(4096), b""):
-                        conn.send(chunk)
-                conn.send(b"EOF")
-                writer.write(f"{filename} download successful\n".encode())
+                
+                if not filename:
+                    writer.write("Error: Filename not provided\n")
+                    continue                    
 
-            # Upload command ssl transfer logic
-            elif cmd == "upload":
-                if not filename:
-                    writer.write(b"Error: Filename not provided\n")
-                    continue
-                writer.write(b"Ready\n")
                 filepath = os.path.join(DIRECTORY, filename)
-                with open(filepath, "wb") as file:
+                
+                if not os.path.exists(filepath):
+                    writer.write("Error: Specified file doesn't exist\n")
+                    continue
+
+                filesize = os.path.getsize(filepath)
+                writer.write(f"{filesize}\n".encode())
+                writer.flush()
+
+                with open(filepath, "rb") as file:
                     while True:
-                        chunk = conn.recv(4096)
-                        if chunk == b"EOF":
+                        chunk = file.read(4096)
+                        if not chunk:
+                            break
+                        ssl_conn.sendall(chunk)
+            
+                writer.write(f"{filename} download successful\n".encode())
+                writer.flush()
+
+            # Upload command logics for ssl transfer
+            elif cmd == "upload":
+                
+                if not user_permissions["upload"]:
+                    writer.write("Insufficient permissions\n")
+                    continue
+                
+                if not filename:
+                    writer.write("Error: Filename not provided\n")
+                    continue   
+
+                filepath = os.path.join(DIRECTORY, filename)
+
+                writer.write("Ready\n")
+                writer.flush()
+
+                filesize_line = reader.readline()
+                if not filesize_line:
+                    writer.write("Error: Filesize not provided\n")
+                    continue
+
+                try:
+                    filesize = int(filesize_line.strip())
+                except ValueError:
+                    writer.write("Error: Invalid filesize\n")
+                    continue
+
+                remaining = filesize
+                with open(filepath, "wb") as file:
+                    while remaining > 0:
+                        chunk = ssl_conn.recv(min(4096, remaining))
+                        if not chunk:
                             break
                         file.write(chunk)
+                        remaining -= len(chunk)
+
                 writer.write(f"{filename} upload successful\n".encode())
-        
+                writer.flush()
+
+            # Delete command logic
+            elif cmd == "delete":
+                
+                if not user_permissions["delete"]:
+                    writer.write("Insufficient permissions\n")
+                    continue
+                
+                if not filename:
+                    writer.write("Error: Filename not provided\n")
+                    continue   
+
+                filepath = os.path.join(DIRECTORY, filename)
+
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                    writer.write(f"{filename} deletion successful\n".encode())
+                    writer.flush()
+
+                else:
+                    writer.write("Error: Specified file doesn't exist\n")
+                    writer.flush()
+
             # ls command logic
-            elif cmd.lower() == "ls":
+            elif cmd == "ls":
+                
+                if not user_permissions["ls"]:
+                    writer.write("Insufficient permissions\n")
+                    continue
+
                 files = os.listdir(DIRECTORY)
-                file_list = "\n".join(files) if files else "No files currently available"
-                writer.write(f"{DIRECTORY}:\n{file_list}\n".encode())
+                file_list = "\n".join(files) if files else "No files currently stored"
+                writer.write(f"{DIRECTORY}:\n{file_list}\n")
 
             # Quit command logic
             elif cmd.lower() == "quit":
-                conn.send(b"Session terminated\n")
+                writer.write("Session terminated\n")
+                writer.flush()
                 break
 
             # Invalid command logic
             else:
-                writer.write(
-                    b"Invalid command. Please enter either:\nUpload <filename>\nDownload <filename>\nls\nQuit\n"
-                )
+                writer.write("Invalid command. Please enter either:\nUpload <filename>\nDownload <filename>\nls\nQuit\n")
 
-    # Display client handling errors
+    # Display error messages
+    except ssl.SSLError as e:
+        print(f"SSL error: {e}")
+    
     except Exception as e:
         print(f"Client handling error: {e}")
 
     finally:
-        conn.close()
-        print("Connection closed")
+        ssl_conn.close()
+        print("Client connection terminated:", ssl_conn.getpeercert())
 
 def listen_for_csr():
     """
-    This function ____________________________________________
+    This function defines the logic for how the server listens for Certificate Signing Requests
+    (CSR) sent by clients.
     """ 
-    csr_port = 8444
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((HOST, csr_port))
+        sock.bind((HOST, CSR_PORT))
         sock.listen(5)
-        print(f"CSR service listening on {HOST}:{csr_port}")
+        print(f"CSR service listening on {HOST}:{CSR_PORT}")
 
         while True:
             client_sock, client_addr = sock.accept()
+            client_sock.settimeout(10)
             print(f"CSR service connection with {client_addr}")
-            receive_csr(client_sock)
 
-def receive_csr(sock):
+            threading.Thread(
+                target=receive_csr,
+                args=(client_sock, client_addr),
+                daemon=True
+            ).start()
+
+def receive_csr(sock, client_addr):
     """
-    This function ____________________________________________
+    This function defines the logic for how the server receives CSR sent by clients.
     """    
-    csr_data = b""
-    while True:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        csr_data += chunk
-
-    csr_path = os.path.join(CERTIFICATES, "client_csr.pem")
-    with open(csr_path, "wb") as file:
-        file.write(csr_data)
     
-    client_certificate_path = sign_csr(csr_path)
+    try:
+        csr_data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            csr_data += chunk
 
-    with open(client_certificate_path, "rb") as file:
-        sock.sendall(file.read())
+        csr_path = os.path.join(CERTIFICATES, f"{client_addr.replace(".","|")}_csr.pem")
+        with open(csr_path, "wb") as file:
+            file.write(csr_data)
+        
+        signed_certificate_path = sign_csr(csr_path, client_addr)
 
-    sock.close()
-    os.remove(csr_path)
+        with open(signed_certificate_path, "rb") as file:
+            sock.sendall(file.read())
+        print(f"CSR signed and sent to {client_addr}")
 
-def sign_csr(csr_path):
+    except Exception as e:
+        print(f"CSR receipt error from {client_addr}: {e}")
+
+    finally:
+        sock.close()
+        if os.path.exists(csr_path):
+            os.remove(csr_path)
+
+def sign_csr(csr_path, client_addr):
     """
-    This function ____________________________________________
+    This function defines the logic for how the server signs a CSR using the CA certificate
+    and Private Key, and returns the new certificate filepath.
     """
     
     # Define the CA key and certificate filepaths
@@ -182,35 +326,85 @@ def sign_csr(csr_path):
     )
 
     # Write the client's certificate
-    client_username = csr.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
-    client_certificate_path = os.path.join(CERTIFICATES, f"{client_username}_certificate.pem")
+    client_certificate_path = os.path.join(CERTIFICATES, f"{client_addr.replace(".","|")}_certificate.pem")
 
     with open(client_certificate_path, "wb") as file:
         file.write(client_certificate.public_bytes(serialization.Encoding.PEM))
 
     return client_certificate_path
 
+def read_users():
+    """
+    This function initialises the content of the users.json file as a dictionary.
+    """
+
+    if not os.path.exists(USERS):
+        return {}
+    
+    with open(USERS, "r") as file:
+        return json.load(file)
+
+def write_users(users):
+    """
+    This function writes a dictionary to the users.json file.
+    """
+
+    with open(USERS, "w") as file:
+        json.dump(users, file, indent=4)
+
+def authenticate_user(username, password):
+    """
+    This function authenticates received user credentials against the values stored in the 
+    users.json file.
+    """
+    
+    # Prevent server from authenticating users if users.json can't be found 
+    if not os.path.exists(USERS):
+        return None
+
+    # Prevent server from authenticating if the user is not in the user permission file
+    with open(USERS, "r") as file:
+        users = json.load(file)
+        if username not in users:
+            return None
+
+    # Approved user submitted hashes that match the stored hash
+    hash = users[username]["hash"]
+    if not hash:
+        return None
+    if bcrypt.checkpw(password.encode(), hash):                     ##### SALTING FUNCTIONALITY STILL TO BE ADDED
+        return users[username]["role"]
+
+    # Reject ser submitted hashes that don't match the stored hash
+    return None
+
 def main():
     print("---------------------------------------------------------------------------------\n")
     print("                       Secure File Transfer System: Server                       \n")
     print("---------------------------------------------------------------------------------\n")
     
-    # Manage Certificate Signing Request (CSR) service
+    # Start the Certificate Signing Request (CSR) service
     threading.Thread(target = listen_for_csr, daemon = True).start()
 
     # Manage Secure File Transfer System (SFTS) service
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0) as sock:
-        sock.bind((HOST, PORT))
+        sock.bind((HOST, SFTS_PORT))
         sock.listen(5)
-        print(f"SFTS service listening on {HOST}:{PORT}")
+        print(f"SFTS service listening on {HOST}:{SFTS_PORT}")
 
         while True:
             client_sock, client_addr = sock.accept()
-            print(f"SFTS service onnection with {client_addr}")
-            
+            print(f"SFTS service connection with {client_addr}")
+
             try:
                 with context.wrap_socket(client_sock, server_side=True) as ssl_conn:
-                    manage_client(ssl_conn)
+                    
+                    # Define network communication protocol
+                    reader = ssl_conn.makefile("r", encoding="utf-8")
+                    writer = ssl_conn.makefile("w", encoding="utf-8", buffering=1)
+
+                    # Execute SFTS client-facing functions
+                    manage_client(ssl_conn, reader, writer)
             
             except ssl.SSLError as e:
                 print(f"{client_addr} SSL error: {e}")

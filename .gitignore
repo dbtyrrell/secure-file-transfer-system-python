@@ -209,3 +209,6 @@ __marimo__/
 # Certificates directory
 certificates/*
 !certificates/README.md
+
+# User permissions file
+src/users.json
