@@ -2,6 +2,7 @@ cryptography
 datetime
 getpass
 hashlib
+hmac
 ipaddress
 json
 logging
@@ -10,4 +11,3 @@ socket
 ssl
 sys
 threading
-typing

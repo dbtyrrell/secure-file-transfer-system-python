@@ -12,16 +12,16 @@ import socket
 import ssl
 import sys
 import threading
-from typing import TextIO
 
 # Global variables
 HOST: str = "127.0.0.1"                                                                     #"10.16.10.247"
 HOST_CODE: str = "9d695442d1ccee8313ff7f7eaa1566cbe6b32fa4c9e80f7ebd68a36d8df83f5a"
 SFTS_PORT: int = 8443
 CSR_PORT: int = 8444
-DELAY_TOLERANCE: timedelta = timedelta(seconds=30)
 BLOCK_WINDOW: timedelta = timedelta(hours=24)
 BLOCK_DURATION: timedelta = timedelta(hours=24)
+DELAY_TOLERANCE: timedelta = timedelta(seconds=30)
+TERMINATOR: bytes = b"!_end_!"
 
 CERTIFICATES: str = "/workspaces/secure-file-transfer-system-python/certificates/"
 DIRECTORY: str = "/workspaces/secure-file-transfer-system-python/directory/"
@@ -37,7 +37,6 @@ logging.basicConfig(
     format = "[%(asctime)s] [%(levelname)s] %(message)s",
     datefmt = "%y-%m-%d %H:%M:%S"
 )
-
 log = logging.getLogger("SFTS_server")
 
 # Create required filepaths if they don't already exist
@@ -59,7 +58,7 @@ if not os.path.exists(USERS):
     with open(USERS, 'w') as file:
         json.dump({}, file)
 
-# Serialise read/write operations to mitigate race conditions
+# Serialise read/write operations on json files to mitigate race conditions
 auth_failures_file_lock = threading.Lock()
 blocked_ip_file_lock = threading.Lock()
 blocked_passwords_file_lock = threading.Lock()
@@ -74,6 +73,122 @@ with roles_file_lock:
 
     except Exception as e:
         log.error(f"Roles file error: Failed to read from file. {e}.")
+
+def csr_connection(
+        conn: socket.socket, client_addr: tuple[str, int], ca_key: object) -> None:
+    """
+    This function receives CSR connections with clients and returns a certificate valid for 365 
+    days.
+    
+    Args:        
+        conn: A socket connection object enabling binary transfer.
+    
+        client_addr: A tuple containing the client's IP address as a string and port as an int.
+
+        ca_key: A private key object containing the CA key.
+    """
+
+    # Initialise the csr path variable to mitigate exception errors
+    csr_path = None
+    client_ip = client_addr[0]
+
+    try:
+        if evaluate_ip(client_ip):
+            log.warning(f"Authentication rejection: Client {client_addr} blocked.")
+            return
+         
+        # Send 256 bit nonce to client
+        nonce = os.urandom(32)        
+        nonce_hex = nonce.hex().encode() + b"\n"
+        conn.sendall(nonce_hex)
+        
+        # Receive HMAC from client
+        authentication = b""
+        while b"\n" not in authentication:
+            chunk = conn.recv(1024)
+            if not chunk:
+                break
+            authentication += chunk
+
+            if len(authentication) > 4096:
+                log.error(f"CSR error: Incorrect authentication header received from {client_addr}.")
+                raise ValueError("CSR authentication header error")
+
+        if b"\n" not in authentication:
+            log.error(f"CSR error: Incomplete authentication header received from {client_addr}.")
+            return
+
+        header_line, remainder = authentication.split(b"\n",1)
+        client_hmac = header_line.decode().strip()
+
+        # Authenticate HMAC received from client
+        server_hmac = hmac.new(
+            key = HOST_CODE.encode(),
+            msg = nonce,
+            digestmod = hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(client_hmac, server_hmac):
+            log.warning(f"CSR error: Incorrect host code received from {client_addr}.")
+            
+            # Record authentication failure
+            client_ip = client_addr[0]
+            register_auth_failure(client_ip)
+            
+            return
+
+        log.info(f"Client {client_addr} CSR authenctication successful.")
+
+        # Receive CSR data from client
+        chunks = []
+        if remainder:
+            chunks.append(remainder)
+
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+
+        if not chunks:
+            log.error(f"CSR error: No data received from client {client_addr}.")
+
+        # Compile CSR data
+        csr_data = b"".join(chunks)
+
+        # Initialise the client IP address as a variable that can be used for file naming
+        client_ip = client_addr[0].replace(".","")
+
+        csr_path = os.path.join(CERTIFICATES, f"{client_ip}_csr.pem")
+        
+        with open(csr_path, "wb") as file:
+            file.write(csr_data)
+
+        # Sign CSR
+        signed_certificate_path, username = csr_sign(csr_path, client_addr, ca_key)
+
+        # Send certificate to client
+        with open(signed_certificate_path, "rb") as file:
+            conn.sendall(file.read())
+        
+        log.info(f"Client {username} {client_addr} certificate sent.")
+
+    except Exception as e:
+        log.error(f"CSR error: CSR failure for {client_addr}. {e}.")
+
+    finally:
+        try:
+            conn.close()
+        
+        except Exception:
+            pass
+
+        if csr_path and os.path.exists(csr_path):
+            try:
+                os.remove(csr_path)
+
+            except Exception:
+                pass
 
 def csr_decryption(attempts: int = 3) -> tuple[str, object]:
     """
@@ -179,125 +294,6 @@ def csr_listen(ca_key: object) -> None:
                 daemon = True
             ).start()
 
-def csr_connection(
-        conn: socket.socket, client_addr: tuple[str, int], ca_key: object) -> None:
-    """
-    This function receives CSR connections with clients and returns a certificate valid for 365 
-    days.
-    
-    Args:        
-        conn: A socket connection object enabling binary transfer.
-    
-        client_addr: A tuple containing the client's IP address as a string and port as an int.
-
-        ca_key: A private key object containing the CA key.
-    """
-
-    # Initialise the csr path variable to mitigate exception errors
-    csr_path = None
-    client_ip = client_addr[0]
-
-    try:
-        if evaluate_ip(client_ip):
-            log.warning(f"Authentication rejection: Client {client_addr} blocked.")
-###################################################################################################
-###################### DO I WANT TO NOTIFY THE CLIENT THAT THEY ARE BLOCKED? ######################
-###################################################################################################
-            return
-         
-        # Send 256 bit nonce to client
-        nonce = os.urandom(32)        
-        nonce_hex = nonce.hex().encode() + b"\n"
-        conn.sendall(nonce_hex)
-        
-        # Receive HMAC from client
-        authentication = b""
-        while b"\n" not in authentication:
-            chunk = conn.recv(1024)
-            if not chunk:
-                break
-            authentication += chunk
-
-            if len(authentication) > 4096:
-                log.error(f"CSR error: Incorrect authentication header received from {client_addr}.")
-                raise ValueError("CSR authentication header error")
-
-        if b"\n" not in authentication:
-            log.error(f"CSR error: Incomplete authentication header received from {client_addr}.")
-            return
-
-        header_line, remainder = authentication.split(b"\n",1)
-        client_hmac = header_line.decode().strip()
-
-        # Authenticate HMAC received from client
-        server_hmac = hmac.new(
-            key = HOST_CODE.encode(),
-            msg = nonce,
-            digestmod = hashlib.sha256
-        ).hexdigest()
-
-        if not hmac.compare_digest(client_hmac, server_hmac):
-            log.warning(f"CSR error: Incorrect host code received from {client_addr}.")
-            
-            # Record authentication failure
-            client_ip = client_addr[0]
-            register_auth_failure(client_ip)
-            
-            return
-
-        log.info(f"Client {client_addr} CSR authenctication successful.")
-
-        # Receive CSR data from client
-        chunks = []
-        if remainder:
-            chunks.append(remainder)
-
-        while True:
-            chunk = conn.recv(4096)
-            if not chunk:
-                break
-            chunks.append(chunk)
-
-        if not chunks:
-            log.error(f"CSR error: No data received from client {client_addr}.")
-
-        # Compile CSR data
-        csr_data = b"".join(chunks)
-
-        # Initialise the client IP address as a variable that can be used for file naming
-        client_ip = client_addr[0].replace(".","")
-
-        csr_path = os.path.join(CERTIFICATES, f"{client_ip}_csr.pem")
-        
-        with open(csr_path, "wb") as file:
-            file.write(csr_data)
-
-        # Sign CSR
-        signed_certificate_path, username = csr_sign(csr_path, client_addr, ca_key)
-
-        # Send certificate to client
-        with open(signed_certificate_path, "rb") as file:
-            conn.sendall(file.read())
-        
-        log.info(f"Client {username} {client_addr} certificate sent.")
-
-    except Exception as e:
-        log.error(f"CSR error: CSR failure for {client_addr}. {e}.")
-
-    finally:
-        try:
-            conn.close()
-        
-        except Exception:
-            pass
-
-        if csr_path and os.path.exists(csr_path):
-            try:
-                os.remove(csr_path)
-
-            except Exception:
-                pass
-
 def csr_sign(csr_path: str, client_addr: tuple[str, int], ca_key: object) -> tuple[str,str]:
     """
     This function signs a CSR using the Certificate Authority (CA) certificate and Private Key, and 
@@ -384,277 +380,35 @@ def csr_sign(csr_path: str, client_addr: tuple[str, int], ca_key: object) -> tup
     except Exception as e:
         log.error(f"CSR error: Failed to write client {username} {client_addr} certificate. {e}.")
 
-def sfts_listen(password: str) -> None:
+def evaluate_ip(ip: str) -> bool:
     """
-    This function listens for Transport Layer Security (TLS) connections sent by clients, using the 
-    threading module for parallel processing of handler threads.
-    
+    This function evaluates whether a connecting client IP address is currently blocked.
+
     Args:
-        password: A string containing the password used to decrypt the CA and server keys as input 
-        by the server user.
-    """
-
-    # Configure socket connections
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        # Mitigate server crashes and restarts by enabling reuse of socket addresses 
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
-        try:
-            sock.bind((HOST, SFTS_PORT))
-            sock.listen(5)
-            log.info(f"SFTS service bound to {HOST}:{SFTS_PORT}.")
-
-        except Exception as e:
-            log.critical(f"SFTS error: Failed to bind SFTS service to port {SFTS_PORT}. {e}.")
-
-        # Initialise placeholder client address to prevent variable errors in exception reporting
-        client_addr = ("unknown",0)
-
-        while True:
-            try:
-                conn, client_addr = sock.accept()
-            
-            except Exception as e:
-                log.error(f"SFTS error: Connection with failure with client {client_addr}. {e}.")
-                continue
-            
-            log.info(f"SFTS service connection success with client {client_addr}.")
-
-            conn.settimeout(120)
-
-            threading.Thread(
-                target = sfts_connection,
-                args = [conn, client_addr, password],
-                daemon = True
-            ).start()
-
-def sfts_connection(conn: socket.socket, client_addr: tuple[str, int], password: str) -> None:
-    """
-    This function establishes SSL connections with clients and initiates authentication,
-    authorisation and SFTS operation functions.
-    
-    Args:
-        conn: A socket connection object enabling binary transfer.
-
-        client_addr: A tuple containing the client's IP address as a string and port as an int.
-
-        password: A string containing the password used to decrypt the CA and server keys as input 
-        by the server user.
-    """
-    
-    # Initialise placeholder client address to prevent exception reporting errors
-    username = "unknown"
-    client_ip = client_addr[0]
-
-    try:
-        # Evaluate whether the client IP is currently blocked and terminate connection if True
-        if evaluate_ip(client_ip):
-            log.warning(f"Authentication rejection: Client {client_addr} blocked.")
-###################################################################################################
-###################### DO I WANT TO NOTIFY THE CLIENT THAT THEY ARE BLOCKED? ######################
-###################################################################################################
-            return
-        
-        context = sfts_context(password)
-        with context.wrap_socket(conn, server_side = True) as ssl_conn:
-            log.info(f"SFTS service connection success with client {client_addr}.")
-
-###################################################################################################
-###################################### POTENTIAL REMOVAL ##########################################
-###################################################################################################
-            # # Define server-client communication protocol
-            # reader = ssl_conn.makefile("r", encoding = "utf-8")
-            # writer = ssl_conn.makefile("w", encoding = "utf-8", buffering = 1)
-###################################################################################################
-###################################### POTENTIAL REMOVAL ##########################################
-###################################################################################################
-
-            # Authenticate client
-            user_authentication, username, user_role = sfts_authenticate(ssl_conn, client_addr)
-            
-            # Disconnect from clients that failed authentication
-            if not user_authentication:
-                log.warning(f"Authentication error: Client {username} {client_addr} failure.")
-                return
-
-            # Recieve commands from client
-            sfts_operations(ssl_conn, client_addr, username, user_role)
-
-    # Common error handling
-    except ssl.SSLError as _:
-        log.error(f"SFTS error: Client {client_addr} SSL/TLS error. {_}.")
-
-    except Exception as e:
-        log.error(f"SFTS error: Client {client_addr} connection failure. {e}.")
-
-    finally:
-        try:
-            conn.close()
-        
-        except Exception as e:
-            log.error(f"SFTS error: Client {username} {client_addr} connection error. {e}.")
-            pass
-        
-        log.info(f"Connection with client {username} {client_addr} closed")
-
-def sfts_context(password: str) -> ssl.SSLContext:
-    """
-    This function creates a hardened SSL context using TLS 1.2 and Public Key Infrastructure 
-    (PKI).
-    
-    Args:
-        password: A string containing the password used to decrypt the CA and server keys as input 
-        by the server user.
+        ip: A string containing the IP address of a connecting client.
 
     Returns:
-        A SSL object containing the CA, server certificate and private key.
+        A bool containing False if the client IP address is not currently blocked, else True.
     """
 
-    try:
-        # Default to newest TLS version
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    timestamp = datetime.now(timezone.utc).timestamp()
+    blocked = read_auth_failures()
 
-        # Security configuration
-        context.minimum_version = ssl.TLSVersion.TLSv1_2
-        context.options |= ssl.OP_NO_COMPRESSION
-        context.set_ciphers("ECDHE+AESGCM")
-
-        # Initilaise SSL certificates and keys as variables
-        context.load_cert_chain(
-            certfile = f"{CERTIFICATES}server_certificate.pem", 
-            keyfile = f"{CERTIFICATES}server_key.pem",
-            password = password
-        )
-
-        context.verify_mode = ssl.CERT_REQUIRED
-        context.load_verify_locations(f"{CERTIFICATES}ca_certificate.pem")
-
-        log.info("SSL context initialisation success.")
-        return context
-
-    except Exception as e:
-        log.critical(f"Fatal error: SSL context initialisation failure. {e}.")
-
-def sfts_authenticate(
-        ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int]) -> list[bool, str, str]:
-    """
-    This function authenticates the received client user credentials against the values stored in 
-    the server's users.json file.
+    blocked_expiry = blocked.get(ip)
     
-    Args:
-        ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
+    # Return False for IP addresses not in the blocked dictionary
+    if blocked_expiry is None:
+        return False
 
-        client_addr: A tuple containing the client's IP address as a string and port as an int.
+    # Return True for IP addresses in the blocked dictionary with active blocks
+    if blocked_expiry > timestamp:
+        return True
 
-    Returns:
-        _______________________________ A list containing a bool defining whether the user passed SFTS authentication and
-        a string containing the username submitted by the client. _____________________________________________
-        ______This function returns the role assigned to the user in the users.json file. Users not listed in the users.json file are assigned the default 'unregistered' role title.
-
-    """
-
-    try:
-        # Send 256 bit nonce to client
-        nonce = os.urandom(32)        
-        nonce_hex = nonce.hex().encode() + b"\n"
-        ssl_conn.sendall(nonce_hex)
-        
-        # Receive HMAC from client
-        authentication = b""
-        while b"\n" not in authentication:
-            chunk = ssl_conn.recv(1024)
-            if not chunk:
-                break
-            authentication += chunk
-
-            if len(authentication) > 4096:
-                log.error(
-                    f"SFTS error: Incorrect authentication header received from {client_addr}.")
-                raise ValueError("SFTS authentication header error")
-
-        if b"\n" not in authentication:
-            log.error(f"SFTS error: Incomplete authentication header received from {client_addr}.")
-            return False, "unknown", "unregistered"
-
-        header_line, remainder = authentication.split(b"\n",1)
-        client_hmac = header_line.decode().strip()
-
-        # Receive username from client
-        username_bytes = b""
-        while b"\n" not in username_bytes:
-            chunk = ssl_conn.recv(1024)
-            if not chunk:
-                break
-            username_bytes += chunk
-
-            if len(username_bytes) > 4096:
-                log.error(f"SFTS error: Incorrect username header sent by client {client_addr}.")
-                raise ValueError("Username header error")
-
-        if b"\n" not in username_bytes:
-            log.error(f"SFTS error: Incomplete username header sent by client {client_addr}.")
-            return False, "unknown", "unregistered"
-
-        header_line, remainder = username_bytes.split(b"\n",1)
-        username = header_line.decode().strip()
-
-        # Initialise client variables
-        users = read_users()
-        timestamp = datetime.now(timezone.utc).timestamp()
-
-        if username not in users:
-            # Register first time users
-            user_role = "registered"
-            users[username] = {
-                "hash":client_hmac, 
-                "role":user_role, 
-                "created":timestamp,
-                "modified":timestamp
-                }
-            write_users(users)
-            log.info(f"New user registration: Client {username} {client_addr}.")
-
-        else:
-            # Initialise credentials for returning client users
-            password_hash = users[username]["hash"]
-            user_role = users[username]["role"]
-
-            # Authenticate HMAC received from returning client users
-            server_hmac = hmac.new(
-                key = password_hash.encode(),
-                msg = nonce,
-                digestmod = hashlib.sha256
-            ).hexdigest()
-
-            if not hmac.compare_digest(client_hmac, server_hmac):
-                log.warning(
-                    f"SFTS error: Incorrect password sent by client {username} {client_addr}.")
-                
-                # Record authentication failure
-                client_ip = client_addr[0]
-                register_auth_failure(client_ip)
-
-                # Notify client of authentication failure
-                result_bytes = b"False|denied\n"
-                ssl_conn.sendall(result_bytes)
-                
-                return False, username, user_role
-
-        log.info(f"Client {username} {client_addr} SFTS authenctication successful.")
-
-        # Notify client of authentication success
-        result_bytes = b"True|" + user_role.encode() + b"\n"
-        ssl_conn.sendall(result_bytes)
-
-        # Update last_access variable in users.json
-        users[username]["last_access"] = timestamp
-        write_users(users)
-
-        return True, username, user_role
-
-    except Exception as e:
-        log.error(f"SFTS error: Authentication failure for {client_addr}. {e}.")
-        return False, "unknown", "unregistered"
+    # Return False and delete entries for IP addresses in the block dictionary with expired blocks.
+    del blocked[ip]
+    write_blocked_ip
+    log.info(f"Client {ip} block expired and removed from blocked_ip.json")
+    return False
 
 def read_auth_failures() -> dict:
     """
@@ -777,229 +531,126 @@ def register_auth_failure(ip: str) -> None:
     failures[ip] = []
     write_auth_failures(failures)
 
-def evaluate_ip(ip: str) -> bool:
+def sfts_authenticate(
+        ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int]) -> list[bool, str, str]:
     """
-    This function evaluates whether a connecting client IP address is currently blocked.
-
-    Args:
-        ip: A string containing the IP address of a connecting client.
-
-    Returns:
-        A bool containing False if the client IP address is not currently blocked, else True.
-    """
-
-    timestamp = datetime.now(timezone.utc).timestamp()
-    blocked = read_auth_failures()
-
-    blocked_expiry = blocked.get(ip)
+    This function authenticates the received client user credentials against the values stored in 
+    the server's users.json file.
     
-    # Return False for IP addresses not in the blocked dictionary
-    if blocked_expiry is None:
-        return False
-
-    # Return True for IP addresses in the blocked dictionary with active blocks
-    if blocked_expiry > timestamp:
-        return True
-
-    # Return False and delete entries for IP addresses in the block dictionary with expired blocks.
-    del blocked[ip]
-    write_blocked_ip
-    log.info(f"Client {ip} block expired and removed from blocked_ip.json")
-    return False
-
-def write_auth_failures(auth_failures: dict) -> None:
-    """
-    This function writes a dictionary to the auth_failures.json file.
-        
-    Args:
-        auth_failures: A dictionary containing the timestamps of client authentication failures.
-    """
-
-    with auth_failures_file_lock:
-        try:
-            with open(AUTH_FAILURES, "w") as file:
-                json.dump(auth_failures, file, indent = 4)
-
-        except Exception as e:
-            log.error(f"Authorisation failures file error: Failed to write file. {e}.")
-            return
-
-def write_blocked_ip(blocked_ip: dict) -> None:
-    """
-    This function writes a dictionary to the users.json file.
-        
-    Args:
-        blocked_ip: A dictionary containing the timestamp of when the blocks on client IP 
-        addresses will expire.
-    """
-
-    with blocked_ip_file_lock:
-        try:
-            with open(BLOCKED_IP, "w") as file:
-                json.dump(blocked_ip, file, indent = 4)
-
-        except Exception as e:
-            log.error(f"Blocked IP file error: Failed to write file. {e}.")
-            return
-
-def write_users(users: dict) -> None:
-    """
-    This function writes a dictionary to the users.json file.
-        
-    Args:
-        users: A dictionary containing the details of all client users.
-    """
-
-    with users_file_lock:
-        try:
-            with open(USERS, "w") as file:
-                json.dump(users, file, indent = 4)
-
-        except Exception as e:
-            log.error(f"Users file error: Failed to write file. {e}.")
-            return
-
-def sfts_operations(
-        ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username: str, 
-        user_role: str) -> None:
-
-    """
-    This function manages SSL connections with clients, incorporating function calls for client 
-    initiated commands.
-
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
-    
+
         client_addr: A tuple containing the client's IP address as a string and port as an int.
-        
-        username: A string containing the username received from the client user.
-        
-        user_role: A string containing the client user's role as listed in the users.json file.
+
+    Returns:
+        _______________________________ A list containing a bool defining whether the user passed SFTS authentication and
+        a string containing the username submitted by the client. _____________________________________________
+        ______This function returns the role assigned to the user in the users.json file. Users not listed in the users.json file are assigned the default 'unregistered' role title.
+
     """
 
-    log.info(f"Client {username} {client_addr} initiated SFTS operations.")
-
-    while True:               
-
-        # Receive command from client
-        cmd_bytes = b""
-        while b"\n" not in cmd_bytes:
+    try:
+        # Send 256 bit nonce to client
+        nonce = os.urandom(32)        
+        nonce_hex = nonce.hex().encode() + b"\n"
+        ssl_conn.sendall(nonce_hex)
+        
+        # Receive HMAC from client
+        authentication = b""
+        while b"\n" not in authentication:
             chunk = ssl_conn.recv(1024)
             if not chunk:
                 break
-            cmd_bytes += chunk
+            authentication += chunk
 
-            if len(cmd_bytes) > 4096:
-                log.error(f"Cmd error: Incorrect command header sent by client {client_addr}.")
-                raise ValueError("Cmd header error")
+            if len(authentication) > 4096:
+                log.error(
+                    f"SFTS error: Incorrect authentication header received from {client_addr}.")
+                raise ValueError("SFTS authentication header error")
 
-        if b"\n" not in cmd_bytes:
-            log.error(f"Cmd error: Incomplete command header sent by client {client_addr}.")
-            return
+        if b"\n" not in authentication:
+            log.error(f"SFTS error: Incomplete authentication header received from {client_addr}.")
+            return False, "unknown", "unregistered"
 
-        # Initialise command variables
-        header_line, remainder = cmd_bytes.split(b"\n",1)
-        cmd, timestamp = header_line.decode().strip().split("|",maxsplit = 1)   
+        header_line, remainder = authentication.split(b"\n",1)
+        client_hmac = header_line.decode().strip()
 
-# Initialise command variables
-        try:
-            cmd = cmd.lower() 
-            timestamp = datetime.fromisoformat(timestamp)
+        # Receive username from client
+        username_bytes = b""
+        while b"\n" not in username_bytes:
+            chunk = ssl_conn.recv(1024)
+            if not chunk:
+                break
+            username_bytes += chunk
 
-        except Exception as e:
-            log.error(f"Command error: Client {username} {client_addr} sent incorrect command data"
-                      f" type. {e}.")
-            continue
+            if len(username_bytes) > 4096:
+                log.error(f"SFTS error: Incorrect username header sent by client {client_addr}.")
+                raise ValueError("Username header error")
 
-        # Validate client command timestamp
-        if not timestamp_validation(timestamp, client_addr, username):
-            log.error(f"Command error: Client {username} {client_addr} exceeded delay threshold.")
-            continue
+        if b"\n" not in username_bytes:
+            log.error(f"SFTS error: Incomplete username header sent by client {client_addr}.")
+            return False, "unknown", "unregistered"
 
-        # Validate client role permissions
-        if not roles[user_role][cmd]:
-            log.error(f"Command error: Client {username} {client_addr} called {cmd} without role"
-                      " permissions.")
-            continue
+        header_line, remainder = username_bytes.split(b"\n",1)
+        username = header_line.decode().strip()
 
-        # Action client command
-        if cmd == "admin":
-            sfts_cmd_administer(ssl_conn, client_addr, username)
-        
-        elif cmd == "delete":
-            sfts_cmd_delete(ssl_conn, client_addr, username)
+        # Initialise client variables
+        users = read_users()
+        timestamp = datetime.now(timezone.utc).timestamp()
 
-        elif cmd == "download":
-            sfts_cmd_download(ssl_conn, client_addr, username)
-
-        elif cmd == "exit":
-            log.info(f"Client {username} {client_addr} terminated session")
-            break
-
-        elif cmd == "ls":
-            sfts_cmd_ls(ssl_conn, client_addr, username)
-
-        elif cmd == "update":
-            sfts_cmd_update(ssl_conn, client_addr, username)
-
-        elif cmd == "upload":
-            sfts_cmd_upload(ssl_conn, client_addr, username)
+        if username not in users:
+            # Register first time users
+            user_role = "registered"
+            users[username] = {
+                "hash":client_hmac, 
+                "role":user_role, 
+                "created":timestamp,
+                "modified":timestamp
+                }
+            write_users(users)
+            log.info(f"New user registration: Client {username} {client_addr}.")
 
         else:
-            log.error(
-                f"Command error: Client {username} {client_addr} sent unrecognised command {cmd}.")
+            # Initialise credentials for returning client users
+            password_hash = users[username]["hash"]
+            user_role = users[username]["role"]
 
-def timestamp_validation(timestamp: object, client_addr: tuple[str, int], username: str) -> bool:
-    """
-    This function mitigates against replay attacks by calculating the difference between timestamps 
-    embedded in client communication and timestamps generated by the server.
-    
-    Args:
-        timestamp: An object containing the date and time in UTC +0:00, identifying when the 
-        received message was sent by the client.
+            # Authenticate HMAC received from returning client users
+            server_hmac = hmac.new(
+                key = password_hash.encode(),
+                msg = nonce,
+                digestmod = hashlib.sha256
+            ).hexdigest()
 
-        client_addr: A tuple containing the client's IP address as a string and port as an int.
+            if not hmac.compare_digest(client_hmac, server_hmac):
+                log.warning(
+                    f"SFTS error: Incorrect password sent by client {username} {client_addr}.")
+                
+                # Record authentication failure
+                client_ip = client_addr[0]
+                register_auth_failure(client_ip)
 
-        username: A string containing the username received from the client user.
+                # Notify client of authentication failure
+                result_bytes = b"False|denied\n"
+                ssl_conn.sendall(result_bytes)
+                
+                return False, username, user_role
 
-    Returns:
-        A Bool containing True if the age of the recieved timestamp is less than the DELAY_TOLERANCE 
-        global variable, else False.
-    """
-    
-    try:
-        delay = datetime.now(timezone.utc) - timestamp
-    
-        if delay < DELAY_TOLERANCE:
-            return True
+        log.info(f"Client {username} {client_addr} SFTS authenctication successful.")
 
-        log.error(
-            f"Timestamp error: Client {username} {client_addr} timestamp exceeds delay tolerance.")
-        return False   
-    
+        # Notify client of authentication success
+        result_bytes = b"True|" + user_role.encode() + b"\n"
+        ssl_conn.sendall(result_bytes)
+
+        # Update last_access variable in users.json
+        users[username]["last_access"] = timestamp
+        write_users(users)
+
+        return True, username, user_role
+
     except Exception as e:
-        log.error(f"Timestamp error: Client {username} {client_addr} validation failure. {e}.")
-        return False
-
-
-def sfts_cmd_administer(
-        ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username: str) -> None:
-    """
-    This function _________________________________________
-    
-    Args:
-        ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
-    
-        client_addr: A tuple containing the client's IP address as a string and port as an int.
-
-        username: A string containing the username received from the client user.  
-    """
-    
-    log.info(f"Client {username} {client_addr} initiated the administer command.")
-
-###################################################################################################
-######################################## NOT YET DEVELOPED ########################################
-###################################################################################################
+        log.error(f"SFTS error: Authentication failure for {client_addr}. {e}.")
+        return False, "unknown", "unregistered"
 
 def sfts_cmd_delete(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username: str) -> None:
     """
@@ -1107,20 +758,48 @@ def sfts_cmd_ls(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username:
 
     log.info(f"Client {username} {client_addr} initiated the list command.")
 
-    # try:
-    #     # files = sorted(file.name for file in DIRECTORY.iterdir() if file.is_file())
-    #     files = os.listdir(DIRECTORY)
-    #     file_list = "\n".join(files) if files else "Directory empty"
-        
-    #     log.info(f"Client {username} {client_addr} listing success {file_list}.")
-        
-    #     writer.write(f"Directory contents:\n{file_list}\n")
-    #     writer.flush()
+    try:
+        files = os.listdir(DIRECTORY)
+        file_list = "\n".join(files) if files else "Directory empty"
 
-    # except Exception as e:
-    #     log.error(f"Command error: Client {username} {client_addr} listing failure {file_list}. {e}.")
-    #     writer.write("Error: Unable to list directory\n!reset!\n")
-    #     writer.flush()
+        msg = (
+            f"Directory contents:\n"
+            f"{file_list}\n"
+            f"{TERMINATOR}"
+        ).encode()
+
+        ssl_conn.sendall(msg)
+
+        log.info(f"Client {username} {client_addr} listing success {file_list}.")
+
+    except Exception as e:
+        error_msg = ("Uable to list host server directory\n").encode()
+        try:
+            ssl_conn.sendall(error_msg)
+
+        except Exception:
+            pass
+
+        log.error(f"Command error: Client {username} {client_addr} list failure {file_list}. {e}.")
+
+def sfts_cmd_modify(
+        ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username: str) -> None:
+    """
+    This function _________________________________________
+    
+    Args:
+        ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
+    
+        client_addr: A tuple containing the client's IP address as a string and port as an int.
+
+        username: A string containing the username received from the client user.  
+    """
+    
+    log.info(f"Client {username} {client_addr} initiated the modify command.")
+
+###################################################################################################
+######################################## NOT YET DEVELOPED ########################################
+###################################################################################################
 
 def sfts_cmd_update(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username: str) -> None:
     """
@@ -1215,6 +894,318 @@ def sfts_cmd_upload(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], usern
     #     log.error(f"Command error: Client {username} {client_addr} upload failure {filepath}. {e}")
     #     writer.write(f"Error: Unable to upload {filename}\n!reset!\n")
     #     writer.flush()
+
+def sfts_connection(conn: socket.socket, client_addr: tuple[str, int], password: str) -> None:
+    """
+    This function establishes SSL connections with clients and initiates authentication,
+    authorisation and SFTS operation functions.
+    
+    Args:
+        conn: A socket connection object enabling binary transfer.
+
+        client_addr: A tuple containing the client's IP address as a string and port as an int.
+
+        password: A string containing the password used to decrypt the CA and server keys as input 
+        by the server user.
+    """
+    
+    # Initialise placeholder client address to prevent exception reporting errors
+    username = "unknown"
+    client_ip = client_addr[0]
+
+    try:
+        # Evaluate whether the client IP is currently blocked and terminate connection if True
+        if evaluate_ip(client_ip):
+            log.warning(f"Authentication rejection: Client {client_addr} blocked.")
+            return
+        
+        context = sfts_context(password)
+        with context.wrap_socket(conn, server_side = True) as ssl_conn:
+            log.info(f"SFTS service connection success with client {client_addr}.")
+
+            # Authenticate client
+            user_authentication, username, user_role = sfts_authenticate(ssl_conn, client_addr)
+            
+            # Disconnect from clients that failed authentication
+            if not user_authentication:
+                log.warning(f"Authentication error: Client {username} {client_addr} failure.")
+                return
+
+            # Recieve commands from client
+            sfts_operations(ssl_conn, client_addr, username, user_role)
+
+    # Common error handling
+    except ssl.SSLError as _:
+        log.error(f"SFTS error: Client {client_addr} SSL/TLS error. {_}.")
+
+    except Exception as e:
+        log.error(f"SFTS error: Client {client_addr} connection failure. {e}.")
+
+    finally:
+        try:
+            conn.close()
+        
+        except Exception as e:
+            log.error(f"SFTS error: Client {username} {client_addr} connection error. {e}.")
+            pass
+        
+        log.info(f"Connection with client {username} {client_addr} closed")
+
+def sfts_context(password: str) -> ssl.SSLContext:
+    """
+    This function creates a hardened SSL context using TLS 1.2 and Public Key Infrastructure 
+    (PKI).
+    
+    Args:
+        password: A string containing the password used to decrypt the CA and server keys as input 
+        by the server user.
+
+    Returns:
+        A SSL object containing the CA, server certificate and private key.
+    """
+
+    try:
+        # Default to newest TLS version
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+        # Security configuration
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.options |= ssl.OP_NO_COMPRESSION
+        context.set_ciphers("ECDHE+AESGCM")
+
+        # Initilaise SSL certificates and keys as variables
+        context.load_cert_chain(
+            certfile = f"{CERTIFICATES}server_certificate.pem", 
+            keyfile = f"{CERTIFICATES}server_key.pem",
+            password = password
+        )
+
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.load_verify_locations(f"{CERTIFICATES}ca_certificate.pem")
+
+        log.info("SSL context initialisation success.")
+        return context
+
+    except Exception as e:
+        log.critical(f"Fatal error: SSL context initialisation failure. {e}.")
+
+def sfts_listen(password: str) -> None:
+    """
+    This function listens for Transport Layer Security (TLS) connections sent by clients, using the 
+    threading module for parallel processing of handler threads.
+    
+    Args:
+        password: A string containing the password used to decrypt the CA and server keys as input 
+        by the server user.
+    """
+
+    # Configure socket connections
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        # Mitigate server crashes and restarts by enabling reuse of socket addresses 
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        try:
+            sock.bind((HOST, SFTS_PORT))
+            sock.listen(5)
+            log.info(f"SFTS service bound to {HOST}:{SFTS_PORT}.")
+
+        except Exception as e:
+            log.critical(f"SFTS error: Failed to bind SFTS service to port {SFTS_PORT}. {e}.")
+
+        # Initialise placeholder client address to prevent variable errors in exception reporting
+        client_addr = ("unknown",0)
+
+        while True:
+            try:
+                conn, client_addr = sock.accept()
+            
+            except Exception as e:
+                log.error(f"SFTS error: Connection with failure with client {client_addr}. {e}.")
+                continue
+            
+            log.info(f"SFTS service connection success with client {client_addr}.")
+
+            conn.settimeout(120)
+
+            threading.Thread(
+                target = sfts_connection,
+                args = [conn, client_addr, password],
+                daemon = True
+            ).start()
+
+def sfts_operations(
+        ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username: str, 
+        user_role: str) -> None:
+
+    """
+    This function manages SSL connections with clients, incorporating function calls for client 
+    initiated commands.
+
+    Args:
+        ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
+    
+        client_addr: A tuple containing the client's IP address as a string and port as an int.
+        
+        username: A string containing the username received from the client user.
+        
+        user_role: A string containing the client user's role as listed in the users.json file.
+    """
+
+    log.info(f"Client {username} {client_addr} initiated SFTS operations.")
+
+    while True:               
+
+        # Receive command from client
+        cmd_bytes = b""
+        while b"\n" not in cmd_bytes:
+            chunk = ssl_conn.recv(1024)
+            if not chunk:
+                break
+            cmd_bytes += chunk
+
+            if len(cmd_bytes) > 4096:
+                log.error(f"Cmd error: Incorrect command header sent by client {client_addr}.")
+                raise ValueError("Cmd header error")
+
+        if b"\n" not in cmd_bytes:
+            log.error(f"Cmd error: Incomplete command header sent by client {client_addr}.")
+            return
+
+        # Initialise command variables
+        header_line, remainder = cmd_bytes.split(b"\n",1)
+        cmd, timestamp = header_line.decode().strip().split("|",maxsplit = 1)   
+
+# Initialise command variables
+        try:
+            cmd = cmd.lower() 
+            timestamp = datetime.fromisoformat(timestamp)
+
+        except Exception as e:
+            log.error(f"Command error: Client {username} {client_addr} sent incorrect command data"
+                      f" type. {e}.")
+            continue
+
+        # Validate client command timestamp
+        if not timestamp_validation(timestamp, client_addr, username):
+            log.error(f"Command error: Client {username} {client_addr} exceeded delay threshold.")
+            continue
+
+        # Validate client role permissions
+        if not roles[user_role][cmd]:
+            log.error(f"Command error: Client {username} {client_addr} called {cmd} without role"
+                      " permissions.")
+            continue
+
+        # Action client command
+        if cmd == "delete":
+            sfts_cmd_delete(ssl_conn, client_addr, username)
+
+        elif cmd == "download":
+            sfts_cmd_download(ssl_conn, client_addr, username)
+
+        elif cmd == "exit":
+            log.info(f"Client {username} {client_addr} terminated session")
+            break
+
+        elif cmd == "ls":
+            sfts_cmd_ls(ssl_conn, client_addr, username)
+
+        elif cmd == "modify":
+            sfts_cmd_modify(ssl_conn, client_addr, username)
+
+        elif cmd == "update":
+            sfts_cmd_update(ssl_conn, client_addr, username)
+
+        elif cmd == "upload":
+            sfts_cmd_upload(ssl_conn, client_addr, username)
+
+        else:
+            log.error(
+                f"Command error: Client {username} {client_addr} sent unrecognised command {cmd}.")
+
+def timestamp_validation(timestamp: object, client_addr: tuple[str, int], username: str) -> bool:
+    """
+    This function mitigates against replay attacks by calculating the difference between timestamps 
+    embedded in client communication and timestamps generated by the server.
+    
+    Args:
+        timestamp: An object containing the date and time in UTC +0:00, identifying when the 
+        received message was sent by the client.
+
+        client_addr: A tuple containing the client's IP address as a string and port as an int.
+
+        username: A string containing the username received from the client user.
+
+    Returns:
+        A Bool containing True if the age of the recieved timestamp is less than the DELAY_TOLERANCE 
+        global variable, else False.
+    """
+    
+    try:
+        delay = datetime.now(timezone.utc) - timestamp
+    
+        if delay < DELAY_TOLERANCE:
+            return True
+
+        log.error(
+            f"Timestamp error: Client {username} {client_addr} timestamp exceeds delay tolerance.")
+        return False   
+    
+    except Exception as e:
+        log.error(f"Timestamp error: Client {username} {client_addr} validation failure. {e}.")
+        return False
+
+def write_auth_failures(auth_failures: dict) -> None:
+    """
+    This function writes a dictionary to the auth_failures.json file.
+        
+    Args:
+        auth_failures: A dictionary containing the timestamps of client authentication failures.
+    """
+
+    with auth_failures_file_lock:
+        try:
+            with open(AUTH_FAILURES, "w") as file:
+                json.dump(auth_failures, file, indent = 4)
+
+        except Exception as e:
+            log.error(f"Authorisation failures file error: Failed to write file. {e}.")
+            return
+
+def write_blocked_ip(blocked_ip: dict) -> None:
+    """
+    This function writes a dictionary to the users.json file.
+        
+    Args:
+        blocked_ip: A dictionary containing the timestamp of when the blocks on client IP 
+        addresses will expire.
+    """
+
+    with blocked_ip_file_lock:
+        try:
+            with open(BLOCKED_IP, "w") as file:
+                json.dump(blocked_ip, file, indent = 4)
+
+        except Exception as e:
+            log.error(f"Blocked IP file error: Failed to write file. {e}.")
+            return
+
+def write_users(users: dict) -> None:
+    """
+    This function writes a dictionary to the users.json file.
+        
+    Args:
+        users: A dictionary containing the details of all client users.
+    """
+
+    with users_file_lock:
+        try:
+            with open(USERS, "w") as file:
+                json.dump(users, file, indent = 4)
+
+        except Exception as e:
+            log.error(f"Users file error: Failed to write file. {e}.")
+            return
 
 def main() -> None:
     print("---------------------------------------------------------------------------------\n")

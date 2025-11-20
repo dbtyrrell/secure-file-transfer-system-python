@@ -15,16 +15,16 @@ import socket
 import ssl
 import sys
 import threading
-from typing import TextIO
 
 # Global variables
 SFTS_PORT: int = 8443
 CSR_PORT: int = 8444
+TERMINATOR: bytes = b"!_end_!"
 
 CERTIFICATES: str = "/workspaces/secure-file-transfer-system-python/certificates/"
 DIRECTORY: str = "/workspaces/secure-file-transfer-system-python/directory/"
 BLOCKED_PASSWORDS: str = "/workspaces/secure-file-transfer-system-python/src/blocked_passwords.json"
-ROLES_DIR: str = "/workspaces/secure-file-transfer-system-python/src/roles.json"
+ROLES: str = "/workspaces/secure-file-transfer-system-python/src/roles.json"
 
 # Configure logging protocol
 logging.basicConfig(
@@ -32,32 +32,109 @@ logging.basicConfig(
     format = "[%(asctime)s] [%(levelname)s] %(message)s",
     datefmt = "%y-%m-%d %H:%M:%S"
 )
-
 log = logging.getLogger("SFTS_client")
 
 # Create filepaths if required
 os.makedirs(CERTIFICATES, exist_ok = True)
 os.makedirs(DIRECTORY, exist_ok = True)
-
 if not os.path.exists(BLOCKED_PASSWORDS):
     with open(BLOCKED_PASSWORDS, 'w') as file:
         json.dump({}, file)
-
-if not os.path.exists(ROLES_DIR):
-    with open(ROLES_DIR, 'w') as file:
+if not os.path.exists(ROLES):
+    with open(ROLES, 'w') as file:
         json.dump({}, file)
 
-# Serialise read/write operations on the users.json file to mitigate race conditions
+# Serialise read/write operations on json files to mitigate race conditions
+blocked_passwords_file_lock = threading.Lock()
 roles_file_lock = threading.Lock()
 
 # Initialise user role permissions
 with roles_file_lock:
     try:        
-        with open(ROLES_DIR, "r") as file:
-            ROLES = json.load(file)
+        with open(ROLES, "r") as file:
+            roles = json.load(file)
 
     except Exception as e:
         log.error(f"Roles file error: Failed to read from file. {e}.")
+
+def credentials_certificate_initialise(
+        host_certificate_filepath: str, user_private_key: rsa.RSAPrivateKey, 
+        username: str, host_address: str, host_hash: str) -> None:
+    """
+    This function initialises the certificate for the host server using the user's private key.
+    
+    Args:
+        host_certificate_filepath: ________________________________________
+
+        user_private_key: ________________________________________
+
+        username: A string containing the username input by the client user.
+
+        host_address: A string containing the host server's IP address.
+
+        host_hash: A string containing a SHA-256 hex hash of the host code.
+    """
+
+    try:
+        # Generate and send a Certificate Signing Request (CSR) if required
+        if not os.path.exists(host_certificate_filepath):
+            csr_path = csr_generate(username, user_private_key)      
+            csr_send(csr_path, username, host_address, host_hash)
+
+        # Check whether an existing certificate is current and replace if required
+        else:
+            with open(host_certificate_filepath, "rb") as file:
+                certificate = x509.load_pem_x509_certificate(file.read())
+
+            # Delete expire host certificate if required
+            if datetime.now(timezone.utc) > certificate.not_valid_after_utc:
+                os.remove(host_certificate_filepath)
+                log.info(f"Expired client {username} CSR and {host_address} certificate deleted.")
+
+                # Obtain new host certificate
+                csr_path = csr_generate(username, user_private_key)      
+                csr_send(csr_path, username, host_address, host_hash)
+
+        log.info(f"Valid certificate for host server {host_address} confirmed")
+
+    except Exception as e:
+        log.error(f"Credential error: Failed to obtain certificate for {host_address}. {e}.")
+
+def credentials_key_initialise(
+        user_private_key_filepath: str, username: str, user_password: str) -> rsa.RSAPrivateKey:
+    """
+    The function ________________
+    
+    Args:
+        user_private_key_filepath: ____________________________________
+    
+        username: A string containing the username input by the client user.
+
+        user_password: A string containing the password input by the client user.
+
+    Returns:
+        An object ____________________________________
+    """
+
+    # Generate a user specific private key if one doesn't already exist
+    if not os.path.exists(os.path.join(CERTIFICATES, f"{username}_key.pem")):
+        credentials_key_generate(user_private_key_filepath, username, user_password)
+
+    try:
+        with open(user_private_key_filepath, "rb") as file:
+            user_private_key = serialization.load_pem_private_key(
+                file.read(),
+                password = user_password.encode() if user_password else None
+            )
+
+    except InvalidKey:
+        log.error(f"Credential error: Incorrect password (private key).")
+        sys.exit(1)
+
+    log.info(f"Client {username} private key initialised.")
+
+    return user_private_key
+
 
 def credentials_input_host() -> tuple[str, str]:
     """
@@ -79,7 +156,7 @@ def credentials_input_host() -> tuple[str, str]:
             ipaddress.ip_address(host_address)
             break
         except ValueError as e:
-            log.error(f"Credential error: Invalid host server ip address. {e}.")
+            log.error(f"Credential error: Invalid host server IP address. {e}.")
             print("Please enter either:\n"
                   "- An IPv4 address using the format 255.255.255.255, or\n"
                   "- An IPv6 address using the format ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
@@ -131,41 +208,6 @@ def credentials_input_user() -> list[str, str, str]:
 
     return username, user_password, password_hash
 
-def credentials_key_initialise(
-        user_private_key_filepath: str, username: str, user_password: str) -> rsa.RSAPrivateKey:
-    """
-    The function ________________
-    
-    Args:
-        user_private_key_filepath: ____________________________________
-    
-        username: A string containing the username input by the client user.
-
-        user_password: A string containing the password input by the client user.
-
-    Returns:
-        An object ____________________________________
-    """
-
-    # Generate a user specific private key if one doesn't already exist
-    if not os.path.exists(os.path.join(CERTIFICATES, f"{username}_key.pem")):
-        credentials_key_generate(user_private_key_filepath, username, user_password)
-
-    try:
-        with open(user_private_key_filepath, "rb") as file:
-            user_private_key = serialization.load_pem_private_key(
-                file.read(),
-                password = user_password.encode() if user_password else None
-            )
-
-    except InvalidKey:
-        log.error(f"Credential error: Incorrect password (private key).")
-        sys.exit(1)
-
-    log.info(f"Client {username} private key initialised.")
-
-    return user_private_key
-
 def credentials_key_generate(
         user_private_key_filepath: str, username: str, user_password: str) -> None:
     """
@@ -201,49 +243,6 @@ def credentials_key_generate(
         sys.exit(1)
 
     log.info(f"Client {username} private key saved to {user_private_key_filepath}")
-
-def credentials_certificate_initialise(
-        host_certificate_filepath: str, user_private_key: rsa.RSAPrivateKey, 
-        username: str, host_address: str, host_hash: str) -> None:
-    """
-    This function initialises the certificate for the host server using the user's private key.
-    
-    Args:
-        host_certificate_filepath: ________________________________________
-
-        user_private_key: ________________________________________
-
-        username: A string containing the username input by the client user.
-
-        host_address: A string containing the host server's ip address.
-
-        host_hash: A string containing a SHA-256 hex hash of the host code.
-    """
-
-    try:
-        # Generate and send a Certificate Signing Request (CSR) if required
-        if not os.path.exists(host_certificate_filepath):
-            csr_path = csr_generate(username, user_private_key)      
-            csr_send(csr_path, username, host_address, host_hash)
-
-        # Check whether an existing certificate is current and replace if required
-        else:
-            with open(host_certificate_filepath, "rb") as file:
-                certificate = x509.load_pem_x509_certificate(file.read())
-
-            # Delete expire host certificate if required
-            if datetime.now(timezone.utc) > certificate.not_valid_after_utc:
-                os.remove(host_certificate_filepath)
-                log.info(f"Expired client {username} CSR and {host_address} certificate deleted.")
-
-                # Obtain new host certificate
-                csr_path = csr_generate(username, user_private_key)      
-                csr_send(csr_path, username, host_address, host_hash)
-
-        log.info(f"Valid certificate for host server {host_address} confirmed")
-
-    except Exception as e:
-        log.error(f"Credential error: Failed to obtain certificate for {host_address}. {e}.")
 
 def csr_generate(username: str, user_private_key: rsa.RSAPrivateKey) -> str:
     """
@@ -289,7 +288,7 @@ def csr_send(csr_path: str, username: str, host_address: str, host_hash: str) ->
         
         username: A string containing the username input by the client user.
     
-        host_address: A string containing the host server's ip address.
+        host_address: A string containing the host server's IP address.
 
         host_hash: A string containing a SHA-256 hex hash of the host code.
     """  
@@ -372,7 +371,7 @@ def sfts_authenticate(
 
         password_hash: _____________________
 
-        host_address: A string containing the host server's ip address.
+        host_address: A string containing the host server's IP address.
 
     Returns:
         A string containing the user role provided by the host server. 
@@ -388,7 +387,7 @@ def sfts_authenticate(
         nonce_line += chunk
 
         if len(nonce_line) > 4096:
-            log.error(f"SFTS error: Invalid nonce received from {host_address}.")
+            log.error(f"SFTS error: Invalid nonce size received from {host_address}.")
             raise ValueError
 
     if b"\n" not in nonce_line:
@@ -433,152 +432,7 @@ def sfts_authenticate(
 
     return result, user_role
 
-def sfts_connection(
-        host_certificate_filepath: str, user_private_key_filepath: str, username: str, 
-        user_password: str, password_hash: str, host_address: str) -> None:
-    """
-    This function _________________________________________________________
-
-    Args:
-        host_certificate_filepath: ___________
-
-        user_private_key_filepath: ___________
-
-        username: A string containing the username input by the client user.
-
-        user_password: A string containing the password input by the client user.
-
-        password_hash: ____________
-        
-        host_address: A string containing the host server's ip address.
-    """
-    
-    # Configure SSL context
-    context = ssl.create_default_context(
-        ssl.Purpose.SERVER_AUTH, 
-        cafile = f"{CERTIFICATES}ca_certificate.pem"
-    )
-    
-    # Initialise SSL certificates and keys as local variables
-    context.load_cert_chain(
-        certfile = host_certificate_filepath, 
-        keyfile = user_private_key_filepath,
-        password = user_password
-    )
-
-    # Establish SFTS connections
-    with socket.create_connection((host_address, SFTS_PORT)) as sock:
-        with context.wrap_socket(sock, server_hostname = host_address) as ssl_conn:
-
-            try:
-                
-###################################################################################################
-######################################### TO BE EVALUATED #########################################
-###################################################################################################
-                
-                # # Define server|client communication protocol
-                # reader = ssl_conn.makefile("r", encoding="utf-8")
-                # writer = ssl_conn.makefile("w", encoding="utf-8", buffering=1)
-
-###################################################################################################
-######################################### TO BE EVALUATED #########################################
-###################################################################################################
-
-                # Authenticate client
-                authentication, user_role = sfts_authenticate(
-                    ssl_conn, username, password_hash, host_address)
-
-                if not authentication:
-                    log.warning("User credentials failed host server authentication")
-                    sys.exit(1)
-
-                # Recieve commands from client
-                sfts_operations(ssl_conn, username, user_role)
-
-            # Display common error notifications
-            except ssl.SSLError as e:
-                log.error(f"SSL connection error: {e}.")
-                sys.exit(1)
-
-            except ConnectionResetError as e:
-                log.error(f"Connection error: Connection with {host_address} lost. {e}.")
-                sys.exit(1)
- 
-            finally:
-                log.info("Connection closed")
-
-def sfts_operations(ssl_conn: ssl.SSLSocket, username: str, user_role: str) -> None:
-    """
-    This function manages SSL connections with the host server, incorporating function calls for 
-    client initiated commands.
-    
-    Args:
-        ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
-
-        username: A string containing the username input by the client user.
-
-        user_role: A string containing the client user's role as advised by the host server.
-    """
-
-    log.info(f"Client {username} commenced SFTS operations.")
-
-    while True:
-        # Display user interface
-        cmd = str(input("\nEnter SFTS command:\n\n")).strip().lower()
-
-        # Prevent the user from input commands outside of their role permissions.
-
-###################################################################################################
-######################################## NOT YET DEVELOPED ########################################
-###################################################################################################
-
-        # Action user mode selection
-        match cmd:
-            case "admin":
-                sfts_cmd_administer(ssl_conn, username)
-            
-            case "delete":
-                sfts_cmd_delete(ssl_conn, username)
-
-            case "download":
-                sfts_cmd_download(ssl_conn, username)
-
-            case "exit":
-                sfts_cmd_exit(ssl_conn, username)
-
-            case "help":
-                sfts_cmd_help(user_role)                 
-
-            case "ls":
-                sfts_cmd_ls(ssl_conn, username)
-
-            case "update":
-                sfts_cmd_update(ssl_conn, username)
-
-            case "upload":
-                sfts_cmd_upload(ssl_conn, username)
-
-            case _:
-                log.error(f"Command error: Client {username} input an invalid command. {cmd}")
-                continue
-
-def sfts_cmd_administer(ssl_conn, user_role: str) -> None:
-    """
-    This function ________________________________.
-    
-    Args:
-        ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
-
-        user_role: A string containing the client user's role as advised by the host server.
-    """
-
-    log.info(f"Initiated the administer command.")
-
-###################################################################################################
-######################################## NOT YET DEVELOPED ########################################
-###################################################################################################
-
-def sfts_cmd_delete(ssl_conn, user_role: str) -> None:
+def sfts_cmd_delete(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
     """
     This function deletes a file from the host server directory.
     
@@ -599,7 +453,7 @@ def sfts_cmd_delete(ssl_conn, user_role: str) -> None:
     # writer.write(f"{filename}\n")
     # writer.flush()
 
-def sfts_cmd_download(ssl_conn, user_role: str) -> None:
+def sfts_cmd_download(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
     """
     This function downloads a file from the host server directory to the client directory.
     
@@ -656,7 +510,7 @@ def sfts_cmd_download(ssl_conn, user_role: str) -> None:
     # # Successful download notification
     # log.info(f"{filename} written to {DIRECTORY}.")
 
-def sfts_cmd_exit(ssl_conn, user_role: str) -> None:
+def sfts_cmd_exit(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
     """
     This function ________________________________.
     
@@ -684,29 +538,70 @@ def sfts_cmd_help(user_role: str) -> None:
 
     print("\nThe following commands are available to you:\n")
 
-    if ROLES[user_role]["admin"]:
-        print("ADMIN       Administer the role profiles assigned to non-admin users")
-
-    if ROLES[user_role]["delete"]:
+    if roles[user_role]["delete"]:
         print("DELETE      Delete a file from the server directory")
 
-    if ROLES[user_role]["download"]:
+    if roles[user_role]["download"]:
         print("DOWNLOAD    Download a file from the server directory")
 
     print("EXIT        Exit program")
     print("HELP        View available commands")
 
-    if ROLES[user_role]["ls"]:
+    if roles[user_role]["ls"]:
         print("LS          List all files within the server directory")
+
+    if roles[user_role]["modify"]:
+        print("MODIFY      modify the roles assigned to non-admin users")
 
     print("UPDATE      Update your personal user details")
 
-    if ROLES[user_role]["upload"]:
+    if roles[user_role]["upload"]:
         print("UPLOAD      Upload a file to the server directory")
 
-def sfts_cmd_ls(ssl_conn, user_role: str) -> None:
+def sfts_cmd_ls(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
     """
-    This function lists file in the host server directory.
+    This function lists all directories and files contained in the host server directory.
+    
+    Args:
+        ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
+
+        host_address: A string containing the host server's IP address.
+    """
+
+    log.info(f"Initiated the list command.")
+
+    # Send command to server
+    timestamp = datetime.now(timezone.utc).isoformat()
+    msg = (f"ls|{timestamp}\n").encode()
+    ssl_conn.sendall(msg)
+
+    try:
+        # Receive response from server
+        buffer = sfts_response(ssl_conn, host_address)
+
+    except (ConnectionError, ValueError) as e:
+        log.error(f"Command error: Failed to receive response from host server {host_address}")
+        return
+
+    # Remove post-buffer line data from host server response
+    response, _ = buffer.split(TERMINATOR,1)
+
+    # Decompose host server response
+    response_lines = response.split(b"\n")
+    header = response_lines[0].decode(errors = "replace").strip()
+    body = [line.decode(errors = "replace") for line in response_lines[1:] if line]
+
+    # Print host server response
+    print(header)
+    if body:
+        print("\n".join(body))
+    
+    else:
+        print("")
+
+def sfts_cmd_modify(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
+    """
+    This function ________________________________.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
@@ -714,13 +609,13 @@ def sfts_cmd_ls(ssl_conn, user_role: str) -> None:
         user_role: A string containing the client user's role as advised by the host server.
     """
 
-    log.info(f"Initiated the list command.")
+    log.info(f"Initiated the modify command.")
 
-    # timestamp = datetime.now(timezone.utc).isoformat()
-    # writer.write(f"ls|{timestamp}\n")
-    # writer.flush()
+###################################################################################################
+######################################## NOT YET DEVELOPED ########################################
+###################################################################################################
 
-def sfts_cmd_update(ssl_conn, user_role: str) -> None:
+def sfts_cmd_update(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
     """
     This function ________________________________.
     
@@ -736,7 +631,7 @@ def sfts_cmd_update(ssl_conn, user_role: str) -> None:
 ######################################## NOT YET DEVELOPED ########################################
 ###################################################################################################
 
-def sfts_cmd_upload(ssl_conn, user_role: str) -> None:
+def sfts_cmd_upload(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
     """
     This function uploads a file from the client directory to the host server director.
     
@@ -778,6 +673,155 @@ def sfts_cmd_upload(ssl_conn, user_role: str) -> None:
 
     # # Successful upload notification
     # log.info(f"{filename} sent to server.")
+
+def sfts_connection(
+        host_certificate_filepath: str, user_private_key_filepath: str, username: str, 
+        user_password: str, password_hash: str, host_address: str) -> None:
+    """
+    This function _________________________________________________________
+
+    Args:
+        host_certificate_filepath: ___________
+
+        user_private_key_filepath: ___________
+
+        username: A string containing the username input by the client user.
+
+        user_password: A string containing the password input by the client user.
+
+        password_hash: ____________
+        
+        host_address: A string containing the host server's IP address.
+    """
+    
+    # Configure SSL context
+    context = ssl.create_default_context(
+        ssl.Purpose.SERVER_AUTH, 
+        cafile = f"{CERTIFICATES}ca_certificate.pem"
+    )
+    
+    # Initialise SSL certificates and keys as local variables
+    context.load_cert_chain(
+        certfile = host_certificate_filepath, 
+        keyfile = user_private_key_filepath,
+        password = user_password
+    )
+
+    # Establish SFTS connections
+    with socket.create_connection((host_address, SFTS_PORT)) as sock:
+        with context.wrap_socket(sock, server_hostname = host_address) as ssl_conn:
+
+            try:
+                # Authenticate client
+                authentication, user_role = sfts_authenticate(
+                    ssl_conn, username, password_hash, host_address)
+
+                if not authentication:
+                    log.warning("User credentials failed host server authentication")
+                    sys.exit(1)
+
+                # Recieve commands from client
+                sfts_operations(ssl_conn, host_address, username, user_role)
+
+            # Display common error notifications
+            except ssl.SSLError as e:
+                log.error(f"SSL connection error: {e}.")
+                sys.exit(1)
+
+            except ConnectionResetError as e:
+                log.error(f"Connection error: Connection with {host_address} lost. {e}.")
+                sys.exit(1)
+ 
+            finally:
+                log.info("Connection closed")
+
+def sfts_operations(ssl_conn: ssl.SSLSocket, host_address: str, username: str, user_role: str) -> None:
+    """
+    This function manages SSL connections with the host server, incorporating function calls for 
+    client initiated commands.
+    
+    Args:
+        ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
+
+        host_address; ________________________________________
+
+        username: A string containing the username input by the client user.
+
+        user_role: A string containing the client user's role as advised by the host server.
+    """
+
+    log.info(f"Client {username} commenced SFTS operations.")
+
+    while True:
+        # Display user interface
+        cmd = str(input("\nEnter SFTS command:\n\n")).strip().lower()
+
+        # Skip unauthorised commands
+        if not roles[user_role][cmd]:
+            log.error(f"Command error: {username} called {cmd} without role permissions.")
+            continue
+
+        # Process commands
+        match cmd:
+            case "delete":
+                sfts_cmd_delete(ssl_conn, username, host_address)
+
+            case "download":
+                sfts_cmd_download(ssl_conn, username, host_address)
+
+            case "exit":
+                sfts_cmd_exit(ssl_conn, username, host_address)
+
+            case "help":
+                sfts_cmd_help(user_role)                 
+
+            case "ls":
+                sfts_cmd_ls(ssl_conn, host_address)
+
+            case "modify":
+                sfts_cmd_modify(ssl_conn, username, host_address)
+
+            case "update":
+                sfts_cmd_update(ssl_conn, username, host_address)
+
+            case "upload":
+                sfts_cmd_upload(ssl_conn, username, host_address)
+
+            case _:
+                log.error(f"Command error: {username} input an invalid command. {cmd}")
+
+def sfts_response(
+        ssl_conn: ssl.SSLSocket, host_address: str, max_bytes: int = 1024 * 1024) -> bytes:
+    """
+    The function reads from the SSL-wrapped socket connection until the TERMINATOR global variable
+    is found in the received data.
+
+    Args:
+        ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
+
+        host_address: A string containing the host server's IP address.
+
+        max_bytes [optional]: The maximum data size in bytes that will be processed by the function 
+        before a Value Error is raised, with a default value of 1 MB.
+
+    Return:
+        All bytes received up to the end of the TERMINATOR global variable.
+    """
+
+    buffer = b""
+
+    while TERMINATOR not in buffer:
+        chunk = ssl_conn.recv(4096)
+        if not chunk:
+            log.error(f"Command error: Host server {host_address} closed connection prematurely.")
+            raise ConnectionError("Connection closed before completion of sfts_reciever function")
+        buffer += chunk
+
+        if len(buffer) > max_bytes:
+            log.error(f"Command error: Invalid msg size received from host server {host_address}.")
+            raise ValueError("sfts_reciever function argument exceeded allowed messsage size.")
+    
+    return buffer
 
 def main() -> None:
     print("---------------------------------------------------------------------------------\n")
