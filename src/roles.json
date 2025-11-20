@@ -1,0 +1,41 @@
+{
+    "admin" : {
+        "admin": true,
+        "delete": true,
+        "download": true,
+        "exit": true,
+        "help": true,
+        "ls": true,
+        "update": true,
+        "upload": true
+    },
+    "user": {
+        "admin": false,
+        "delete": false,
+        "download": true,
+        "exit": true,
+        "help": true,
+        "ls": true,
+        "update": true,
+        "upload": true
+    },
+    "registered": {
+        "admin": false,
+        "delete": false,
+        "download": false,
+        "exit": true,
+        "help": true,
+        "ls": true,
+        "update": true,
+        "upload": false
+    },
+    "unregistered": {
+        "admin": false,
+        "delete": false,
+        "download": false,
+        "help": true,
+        "ls": false,
+        "update": true,
+        "upload": false
+    }
+}
