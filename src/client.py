@@ -1,7 +1,8 @@
+import base64
 from cryptography import x509
 from cryptography.exceptions import InvalidKey
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.x509.oid import NameOID
 from datetime import datetime, timezone
 import getpass
@@ -128,7 +129,7 @@ def credentials_key_initialise(
             )
 
     except InvalidKey:
-        log.error(f"Credential error: Incorrect password (private key).")
+        log.error(f"Credential error: Incorrect password for private key.")
         sys.exit(1)
 
     log.info(f"Client {username} private key initialised.")
@@ -189,13 +190,13 @@ def credentials_input_user() -> list[str, str, str]:
     while True:
         user_password_prelim = getpass.getpass(prompt = "Enter user password: ")   
 
-        # if not 15 <= len(user_password_prelim) <= 64:                                         ############ COMMENTED OUT FOR TESTING PURPOSES ONLY
-        #     print("Password error: Password length must be between 15 and 64 characters")
-        #     continue
+        if not 15 <= len(user_password_prelim) <= 64:
+            print("Password error: Password length must be between 15 and 64 characters")
+            continue
 
-        # if user_password_prelim.lower() in blocked_list:
-        #     print("Password error: Password must not be easily predictable")
-        #     continue
+        if user_password_prelim.lower() in blocked_passwords:
+            print("Password error: Password must not be easily predictable")
+            continue
 
         user_password = getpass.getpass(prompt = "Confirm user password: ")  
 
@@ -204,7 +205,9 @@ def credentials_input_user() -> list[str, str, str]:
 
         log.error(f"Credential error: Client {username} passwords don't match")
 
-    password_hash = hashlib.sha256(user_password.encode()).hexdigest()
+    salt = username + "|" + user_password
+
+    password_hash = hashlib.sha256(salt.encode()).hexdigest()
 
     return username, user_password, password_hash
 
@@ -297,13 +300,12 @@ def csr_send(csr_path: str, username: str, host_address: str, host_hash: str) ->
 
     with socket.create_connection((host_address, CSR_PORT)) as csr_sock:
         
-        # Receive 256 bit nonce from server
+        # Receive 256 bit nonce from host server
         nonce_line = b""
         while b"\n" not in nonce_line:
             chunk = csr_sock.recv(1024)
             if not chunk:
                 break
-
             nonce_line += chunk
 
             if len(nonce_line) > 4096:
@@ -317,7 +319,7 @@ def csr_send(csr_path: str, username: str, host_address: str, host_hash: str) ->
         header_line, remainder = nonce_line.split(b"\n",1)
         nonce = bytes.fromhex(header_line.decode().strip())
 
-        # Authenticate to server using hmac
+        # Authenticate to host server using hmac
         client_hmac = hmac.new(
             key = host_hash.encode(),
             msg = nonce,
@@ -326,7 +328,7 @@ def csr_send(csr_path: str, username: str, host_address: str, host_hash: str) ->
 
         csr_sock.sendall(client_hmac)
 
-        # Send CSR to server
+        # Send CSR to host server
         with open(csr_path, "rb") as file:
             csr_sock.sendall(file.read())
         
@@ -360,7 +362,8 @@ def csr_send(csr_path: str, username: str, host_address: str, host_hash: str) ->
         log.error(f"Credential error: CSR deletion failure. {csr_path}")
 
 def sfts_authenticate(
-        ssl_conn: ssl.SSLSocket, username: str, password_hash: str, host_address: str) -> str:              
+        ssl_conn: ssl.SSLSocket, username: str, password_hash: str, 
+        host_address: str) -> tuple[str, str]:              
     """
     This function ___________________________.
 
@@ -369,7 +372,8 @@ def sfts_authenticate(
 
         username: A string containing the username input by the client user.
 
-        password_hash: _____________________
+        password_hash: A string containing a SHA256 hash of the concatenation of the client user's
+        username, | character and password.
 
         host_address: A string containing the host server's IP address.
 
@@ -377,7 +381,7 @@ def sfts_authenticate(
         A string containing the user role provided by the host server. 
     """
     
-    # Receive 256 bit nonce from server
+    # Receive 256 bit nonce from host server
     nonce_line = b""
     while b"\n" not in nonce_line:
         chunk = ssl_conn.recv(1024)
@@ -392,12 +396,12 @@ def sfts_authenticate(
 
     if b"\n" not in nonce_line:
         log.error(f"SFTS error: Incomplete nonce received from {host_address}.")
-        return
+        return False, "unregistered"
 
     header_line, remainder = nonce_line.split(b"\n",1)
     nonce = bytes.fromhex(header_line.decode().strip())
 
-    # Authenticate to server using hmac
+    # Authenticate to host server using hmac
     client_hmac = hmac.new(
         key = password_hash.encode(),
         msg = nonce,
@@ -406,11 +410,11 @@ def sfts_authenticate(
 
     ssl_conn.sendall(client_hmac)
 
-    # Send username to server
+    # Send username to host server
     username_bytes = username.encode() + b"\n"
     ssl_conn.sendall(username_bytes)
 
-    # Receive authentication result and user role from server 
+    # Receive authentication result and user role from host server 
     results_bytes = b""
     while b"\n" not in results_bytes:
         chunk = ssl_conn.recv(1024)
@@ -425,112 +429,250 @@ def sfts_authenticate(
 
     if b"\n" not in results_bytes:
         log.error(f"SFTS error: Incomplete results header sent by host server {host_address}.")
-        return
+        return False, "unregistered"
 
     header_line, remainder = results_bytes.split(b"\n",1)
     result, user_role = header_line.decode().split("|",1)
 
     return result, user_role
 
-def sfts_cmd_delete(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
+def sfts_cmd_delete(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
     """
     This function deletes a file from the host server directory.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
 
-        user_role: A string containing the client user's role as advised by the host server.
+        host_address: A string containing the host server's IP address.
     """
 
     log.info(f"Initiated the delete command.")
     
-    # filename = str(input("File to be deleted:").strip())
+    filename = str(input("File to be deleted:").strip())
 
-    # timestamp = datetime.now(timezone.utc).isoformat()
-    # writer.write(f"delete|{timestamp}\n")
-    # writer.flush()
+    # Send command to host server
+    timestamp = datetime.now(timezone.utc).isoformat()
+    msg = (f"delete|{filename}|{timestamp}\n").encode()
+    ssl_conn.sendall(msg)
 
-    # writer.write(f"{filename}\n")
-    # writer.flush()
+    try:
+        # Receive response from host server
+        buffer = sfts_response(ssl_conn, host_address)
 
-def sfts_cmd_download(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
+    except (ConnectionError, ValueError) as e:
+        log.error(f"Command error: Failed to receive response from host server {host_address}")
+        return
+
+    # Remove post-buffer data from host server response
+    response, _ = buffer.split(TERMINATOR,1)
+
+    # Decompose host server response
+    response_lines = response.split(b"\n")
+    header = response_lines[0].decode(errors = "replace").strip()
+    body = [line.decode(errors = "replace") for line in response_lines[1:] if line]
+
+    # Print host server response
+    print(header)
+    if body:
+        print("\n".join(body))
+    
+    else:
+        print("")
+
+def sfts_cmd_download(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
     """
     This function downloads a file from the host server directory to the client directory.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
 
-        user_role: A string containing the client user's role as advised by the host server.
+        host_address: A string containing the host server's IP address.
     """
 
     log.info(f"Initiated the download command.")
 
-    # filename = str(input("File to be downloaded:").strip())
-    # filepath = os.path.join(DIRECTORY, filename)
+    while True:
+        filename = str(input("File to be downloaded:").strip())
+        if filename:
+            break
+        print("Invalid filename")
 
-    # # Prevent accidental overwrites caused by name conflicts
-    # if os.path.exists(filepath):
-    #     log.info(f"A file named {filename} already exists in {DIRECTORY}.\n")
+    filepath = os.path.join(DIRECTORY, filename)
 
-    #     # Obtain user permission to overwrite or cancel download request
-    #     user_choice = str(input("Type 'Yes' to overwrite the existing file or type any other key to cancel: ").strip())
-    #     if user_choice.lower() != "yes":
-    #         return
-    #     log.info(f"Client {username} elected to overwrite {filepath}")
+    # Prevent accidental overwrites caused by name conflicts
+    if os.path.exists(filepath):
+        log.info(f"A file named {filename} already exists in {DIRECTORY}.\n")
 
-    # timestamp = datetime.now(timezone.utc).isoformat()
-    # writer.write(f"download|{timestamp}\n")
-    # writer.flush()
+        # Obtain user permission to overwrite or cancel download request
+        user_choice = str(input(
+            "Type 'Yes' to overwrite the existing file or type any other key to cancel: ").strip())
+        
+        if user_choice.lower() != "yes":
+            log.info(f"Download cancelled to prevent overwrite of {filepath}")
+            return
+        
+        log.info(f"Overwrite of {filepath} approved by user")
 
-    # writer.write(f"{filename}\n")
-    # writer.flush()
+    # Send command to host server
+    timestamp = datetime.now(timezone.utc).isoformat()
+    msg = (f"download|{filename}|{timestamp}\n").encode()
+    ssl_conn.sendall(msg)
 
-    # # Receive expected filesize data from server
-    # filesize_line = reader.readline().strip()
-    # if not filesize_line:
-    #     log.error("Command error: Filesize not received from server.")
-    #     return
-    # try:
-    #     filesize = int(filesize_line)
-    # except ValueError as e:
-    #     print(f"Filesize error: {filesize_line.strip()}.", e)
-    #     return
+    # Receive filesize information from host server
+    try:
+        buffer = sfts_response(ssl_conn, host_address)
 
-    # # Receive download from server
-    # remaining = filesize
-    # with open(filepath, "wb") as file:
-    #     while remaining > 0:
-    #         chunk = ssl_conn.recv(min(4096, remaining))
-    #         if not chunk:
-    #             break
+    except (ConnectionError, ValueError) as e:
+        log.error(f"Command error: Failed to receive response from host server {host_address}")
+        return
 
-    #         file.write(chunk)
-    #         remaining -= len(chunk)
+    # Isolate JSON header in host server response
+    header_bytes, _ = buffer.split(TERMINATOR,1)
 
-    # # Successful download notification
-    # log.info(f"{filename} written to {DIRECTORY}.")
+    # Decode JSON header
+    try:
+        header = json.loads(header_bytes.decode("utf-8"))
 
-def sfts_cmd_exit(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
+    except json.JSONDecodeError:
+        log.error(f"Command error: Unable to decode JSON header")
+        return
+
+    # Print error messages if required
+    if "Error" in header:
+        print(header["Error"])
+        return
+
+    # Initialise JSON header contents
+    try:
+        filename = header["filename"],
+        filesize = int(header["filesize"]),
+        hash_alg = header["hash_algorith"],
+        file_hash = header["file_has"]
+        signed = header["signed"],
+        signature = header["signature"],
+
+    except KeyError as e:
+        log.error(f"Command error: Missing download cmd header contents. {e}")
+        return
+
+    # Print error messages if SHA256 wasn't used to generate the hash.
+    if hash_alg.upper() != "SHA256":
+        log.error(f"Command error: Unrecognised hash algorithm. {hash_alg}")
+
+    # Extract and initilaise the server public key from the server certificate
+    try:
+        der_certificate = ssl_conn.getpeercert(binary_form = True)
+        if not der_certificate:
+            raise ValueError("Server certificate couldn't be initialised")
+        server_certificate = x509.load_der_x509_certificate(der_certificate)
+        server_public_key = server_certificate.public_key()
+
+    except Exception as e:
+        log.error(f"Signature error: Server private key couldn't be initialised. {e}.")
+
+    # Validate signature
+    header_data = f"{filename}|{filesize}|{hash_alg}|{signed}"
+    try:
+        signature = base64.b64decode(signature)
+        server_public_key.verify(
+            signature,
+            header_data,
+            padding.PSS(
+                mgf = padding.MGF1(hashes.SHA256()),
+                salt_length = padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256
+        )
+
+        log.info(f"Signature validated for {filename} from host server {host_address}.")
+
+    except Exception as e:
+        log.error(f"Signature error: Unable to validate signature for {filename} from host server"
+                  f"{host_address}.")
+
+        # Discard excess data in the event on an error processing header
+        remaining = filesize
+        try:
+            while remaining > 0:
+                chunk = ssl_conn.recv(min(4096, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+
+        except Exception:
+            pass
+
+        return
+
+    # Receive file from host server while incrementally 
+    client_hash = hashlib.sha256()
+    remaining = filesize
+
+    try:
+        with open(filepath) as file:
+            while remaining > 0:
+                chunk = ssl_conn.recv(min(4096, remaining))
+                if not chunk:
+                    log.error(f"Command error: Connection with {host_address} lost during download")
+                    raise ConnectionError(f"Connection lost during download")
+                file.write(chunk)
+                client_hash.update(chunk)
+                remaining -= len(chunk)
+
+    except Exception as e:
+        log.error(f"Command error: {filename} download failed. {e}.")
+
+        # Attempt to remove fail downloads
+        try:
+            os.remove(filepath)
+
+        except Exception:
+            pass
+
+        return
+
+    # Verify download file integrity using host server provided hash and client generated hash
+    client_hash.hexdigest()
+    if client_hash.hexdigest() != file_hash:
+        log.error(f"Command error: {filename} failed hash verification.")
+
+        # Attempt to remove unverified downloads
+        try:
+            os.remove(filepath)
+
+        except Exception:
+            pass
+
+        return
+
+    log.info(f"{filename} download and integrity verification successful.")
+
+def sfts_cmd_exit(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
     """
-    This function ________________________________.
+    This function exits the program.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
 
-        user_role: A string containing the client user's role as advised by the host server.
+        host_address: A string containing the host server's IP address.
     """
 
-    log.info(f"Initiated the exit command.")
+    log.info("Initiated the exit command.")
 
-    # timestamp = datetime.now(timezone.utc).isoformat()
-    # writer.write(f"exit|{timestamp}\n")
-    # writer.flush()
-    # log.info("Closing connection.")
-    # sys.exit(1)
+    # Send command to host server
+    timestamp = datetime.now(timezone.utc).isoformat()
+    msg = (f"exit|None|{timestamp}\n").encode()
+    ssl_conn.sendall(msg)
+
+    # Close the server-client connection
+    log.info(f"Closing connection with host server {host_address}.")
+    ssl_conn.close()
+    sys.exit(1)
 
 def sfts_cmd_help(user_role: str) -> None:
     """
-    This function ________________________________.
+    This function provides the client user with information on the commands available based on their
+    user role.
     
     Args:
         user_role: A string containing the client user's role as advised by the host server.
@@ -550,9 +692,6 @@ def sfts_cmd_help(user_role: str) -> None:
     if roles[user_role]["ls"]:
         print("LS          List all files within the server directory")
 
-    if roles[user_role]["modify"]:
-        print("MODIFY      modify the roles assigned to non-admin users")
-
     print("UPDATE      Update your personal user details")
 
     if roles[user_role]["upload"]:
@@ -570,20 +709,20 @@ def sfts_cmd_ls(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
 
     log.info(f"Initiated the list command.")
 
-    # Send command to server
+    # Send command to to host server
     timestamp = datetime.now(timezone.utc).isoformat()
-    msg = (f"ls|{timestamp}\n").encode()
+    msg = (f"ls|None|{timestamp}\n").encode()
     ssl_conn.sendall(msg)
 
     try:
-        # Receive response from server
+        # Receive response from host server
         buffer = sfts_response(ssl_conn, host_address)
 
     except (ConnectionError, ValueError) as e:
         log.error(f"Command error: Failed to receive response from host server {host_address}")
         return
 
-    # Remove post-buffer line data from host server response
+    # Remove post-buffer data from host server response
     response, _ = buffer.split(TERMINATOR,1)
 
     # Decompose host server response
@@ -599,30 +738,14 @@ def sfts_cmd_ls(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
     else:
         print("")
 
-def sfts_cmd_modify(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
+def sfts_cmd_update(ssl_conn: ssl.SSLSocket, username: str) -> None:
     """
     This function ________________________________.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
 
-        user_role: A string containing the client user's role as advised by the host server.
-    """
-
-    log.info(f"Initiated the modify command.")
-
-###################################################################################################
-######################################## NOT YET DEVELOPED ########################################
-###################################################################################################
-
-def sfts_cmd_update(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
-    """
-    This function ________________________________.
-    
-    Args:
-        ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
-
-        user_role: A string containing the client user's role as advised by the host server.
+        username: ______________
     """
 
     log.info(f"Initiated the update command.")
@@ -631,57 +754,150 @@ def sfts_cmd_update(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
 ######################################## NOT YET DEVELOPED ########################################
 ###################################################################################################
 
-def sfts_cmd_upload(ssl_conn: ssl.SSLSocket, user_role: str) -> None:
+def sfts_cmd_upload(ssl_conn: ssl.SSLSocket, user_private_key: rsa.RSAPrivateKey, username: str, 
+                    host_address: str) -> None:
     """
     This function uploads a file from the client directory to the host server director.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
 
-        user_role: A string containing the client user's role as advised by the host server.
+        user_private_key: ________________________.
+
+        username: A string containing the username input by the client user.
+
+        host_address: A string containing the host server's IP address.
     """
 
     log.info(f"Initiated the upload command.")
 
-    # filename = str(input("File to be uploaded:").strip())
-    # filepath = os.path.join(DIRECTORY, filename)
+    while True:
+        filename = str(input("File to be uploaded:").strip())
+        if filename:
+            break
+        print("Invalid filename")
     
-    # # Prevent requests for non-existant files
-    # if not os.path.exists(filepath):
-    #     print("Error: Requested file doesn't exist")
-    #     return
+  # Validate filename
+    if not filename:
+        log.error(f"Command error: Invalid filename.")
+        return
 
-    # # Request upload to server
-    # timestamp = datetime.now(timezone.utc).isoformat()
-    # writer.write(f"upload|{timestamp}\n")
-    # writer.flush()
+    filepath = os.path.join(DIRECTORY, filename)
 
-    # writer.write(f"{filename}\n")
-    # writer.flush()
+    # Validate filepath
+    filepath = os.path.join(DIRECTORY, filename)
+    if not os.path.exists(filepath):
+        log.error(f"Command error: Requested file doesn't exist.")
+        return
 
-    # filesize = os.path.getsize(filepath)
-    # writer.write(f"{filesize}\n")
-    # writer.flush()
+    # Validate user's private key
+    if not user_private_key:
+        log.error(f"Signing error: User's private key failed to initialise.")
+        return
 
-    # # Send upload to server
-    # with open(filepath, "rb") as file:
-    #     while True:
-    #         chunk = file.read(4096)
-    #         if not chunk:
-    #             break
-    #         ssl_conn.sendall(chunk)
+    try:
+        # Calculate filesize
+        filesize = os.path.getsize(filepath)
 
-    # # Successful upload notification
-    # log.info(f"{filename} sent to server.")
+        # Generate a SHA256 hash of the file for integrity verification
+        client_hash = hashlib.sha256()       
+        with open(filepath, "rb") as file:
+            for chunk in iter(lambda: file.read(4096), b""):
+                client_hash.update(chunk)
+        file_hash = client_hash.hexdigest()
+
+    except Exception as e:
+        log.error(f"Command error: Unable to read {filepath}. {e}.")
+
+    # Generate digitial signature
+    try:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        msg = f"{filename}|{filesize}|{file_hash}|{timestamp}".encode("utf-8")
+        signature = user_private_key.sign(
+            msg,
+            padding.PSS(
+                mgf = padding.MGF1(hashes.SHA256()),
+                salt_length = padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        ) 
+
+    except Exception as e:
+        log.error(f"Signing error: Unable to sign upload cmd message. {e}.") 
+        return       
+
+    # Generate JSON header
+    header = {
+        "filename": filename,
+        "filesize": filesize,
+        "hash_algorith": "SHA256",
+        "file_hash": client_hash,
+        "signed": timestamp,
+        "signature": base64.b64encode(signature).decode("ascii")
+    }
+    header_bytes = json.dumps(header, seperators = (",", ":")).encode("utf-8") + TERMINATOR
+
+    # Send command to host server
+    timestamp = datetime.now(timezone.utc).isoformat()
+    msg = (f"upload|{filename}|{timestamp}\n").encode()
+    ssl_conn.sendall(msg)
+
+    # Send JSON header to host server
+    ssl_conn.sendall(header_bytes)
+
+    # Send file to client
+    try:
+        with open(filepath, "rb") as file:
+            while True:
+                chunk = file.read(4096)
+                if not chunk:
+                    break
+                ssl_conn.sendall(chunk)
+
+    except Exception as e:
+        log.error(f"Command error: Upload failure for {filepath}. {e}.")
+
+    log.info(f"{filepath} uploaded to host server {host_address}.")
+
+    try:
+        # Receive response from host server
+        buffer = sfts_response(ssl_conn, host_address)
+
+    except (ConnectionError, ValueError) as e:
+        log.error(f"Command error: Failed to receive response from host server {host_address}")
+        return
+
+    # Remove post-buffer data from host server response
+    response_bytes, _ = buffer.split(TERMINATOR,1)
+
+    # Decompose host server response
+    try:
+        response = json.loads(response_bytes.decode("utf-8"))
+    
+    except json.JSONDecodeError as e:
+        log.error(f"Command error: Unable to decode JSON header")
+        return
+    
+    header = response.get("status", "error")
+    body = response.get("message", "Unknown response from host server")
+
+    if header == "success":
+        log.info(f"{filename} upload successful.")
+
+    else:
+        log.info(f"{filename} upload failed.")
 
 def sfts_connection(
-        host_certificate_filepath: str, user_private_key_filepath: str, username: str, 
-        user_password: str, password_hash: str, host_address: str) -> None:
+        host_certificate_filepath: str, user_private_key: rsa.RSAPrivateKey, 
+        user_private_key_filepath: str, username: str, user_password: str, password_hash: str, 
+        host_address: str) -> None:
     """
     This function _________________________________________________________
 
     Args:
         host_certificate_filepath: ___________
+
+        user_private_key: ___________________
 
         user_private_key_filepath: ___________
 
@@ -689,7 +905,8 @@ def sfts_connection(
 
         user_password: A string containing the password input by the client user.
 
-        password_hash: ____________
+        password_hash: A string containing a SHA256 hash of the concatenation of the client user's
+        username, | character and password.
         
         host_address: A string containing the host server's IP address.
     """
@@ -721,7 +938,7 @@ def sfts_connection(
                     sys.exit(1)
 
                 # Recieve commands from client
-                sfts_operations(ssl_conn, host_address, username, user_role)
+                sfts_operations(ssl_conn, user_private_key, host_address, username, user_role)
 
             # Display common error notifications
             except ssl.SSLError as e:
@@ -735,7 +952,8 @@ def sfts_connection(
             finally:
                 log.info("Connection closed")
 
-def sfts_operations(ssl_conn: ssl.SSLSocket, host_address: str, username: str, user_role: str) -> None:
+def sfts_operations(ssl_conn: ssl.SSLSocket, user_private_key: rsa.RSAPrivateKey, host_address: str,
+                    username: str, user_role: str) -> None:
     """
     This function manages SSL connections with the host server, incorporating function calls for 
     client initiated commands.
@@ -743,7 +961,9 @@ def sfts_operations(ssl_conn: ssl.SSLSocket, host_address: str, username: str, u
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
 
-        host_address; ________________________________________
+        user_private_key: __________________________
+
+        host_address: ________________________________________
 
         username: A string containing the username input by the client user.
 
@@ -757,20 +977,20 @@ def sfts_operations(ssl_conn: ssl.SSLSocket, host_address: str, username: str, u
         cmd = str(input("\nEnter SFTS command:\n\n")).strip().lower()
 
         # Skip unauthorised commands
-        if not roles[user_role][cmd]:
+        if not roles.get(user_role, {}).get(cmd, False):
             log.error(f"Command error: {username} called {cmd} without role permissions.")
             continue
 
         # Process commands
         match cmd:
             case "delete":
-                sfts_cmd_delete(ssl_conn, username, host_address)
+                sfts_cmd_delete(ssl_conn, host_address)
 
             case "download":
-                sfts_cmd_download(ssl_conn, username, host_address)
+                sfts_cmd_download(ssl_conn, host_address)
 
             case "exit":
-                sfts_cmd_exit(ssl_conn, username, host_address)
+                sfts_cmd_exit(ssl_conn, host_address)
 
             case "help":
                 sfts_cmd_help(user_role)                 
@@ -778,14 +998,11 @@ def sfts_operations(ssl_conn: ssl.SSLSocket, host_address: str, username: str, u
             case "ls":
                 sfts_cmd_ls(ssl_conn, host_address)
 
-            case "modify":
-                sfts_cmd_modify(ssl_conn, username, host_address)
-
             case "update":
-                sfts_cmd_update(ssl_conn, username, host_address)
+                sfts_cmd_update(ssl_conn, username)
 
             case "upload":
-                sfts_cmd_upload(ssl_conn, username, host_address)
+                sfts_cmd_upload(ssl_conn, user_private_key, username, host_address)
 
             case _:
                 log.error(f"Command error: {username} input an invalid command. {cmd}")
@@ -848,7 +1065,7 @@ def main() -> None:
 
     # Connect to the SFTS service
     sfts_connection(
-        host_certificate_filepath, user_private_key_filepath, username, 
+        host_certificate_filepath, user_private_key, user_private_key_filepath, username, 
         user_password, password_hash, host_address)
 
 if __name__ == "__main__":
