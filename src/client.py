@@ -12,6 +12,7 @@ import ipaddress
 import json
 import logging
 import os
+from pathlib import Path
 import socket
 import ssl
 import sys
@@ -22,10 +23,11 @@ SFTS_PORT: int = 8443
 CSR_PORT: int = 8444
 TERMINATOR: bytes = b"!_end_!"
 
-CERTIFICATES: str = "/workspaces/secure-file-transfer-system-python/certificates/"
-DIRECTORY: str = "/workspaces/secure-file-transfer-system-python/directory/"
-BLOCKED_PASSWORDS: str = "/workspaces/secure-file-transfer-system-python/src/blocked_passwords.json"
-ROLES: str = "/workspaces/secure-file-transfer-system-python/src/roles.json"
+SFTS_ROOT = str(Path(__file__).resolve().parent.parent)
+CERTIFICATES: str = os.path.join(SFTS_ROOT, "certificates")
+DIRECTORY: str = os.path.join(SFTS_ROOT, "directory")
+BLOCKED_PASSWORDS: str = os.path.join(SFTS_ROOT, "src/blocked_passwords.json")
+ROLES: str = os.path.join(SFTS_ROOT, "src/roles.json")
 
 # Configure logging protocol
 logging.basicConfig(
@@ -66,9 +68,10 @@ def credentials_certificate_initialise(
     This function initialises the certificate for the host server using the user's private key.
     
     Args:
-        host_certificate_filepath: ________________________________________
+        host_certificate_filepath: A string containing the filepath to the CA and server 
+        certificates for the specified host server.
 
-        user_private_key: ________________________________________
+        user_private_key: An object containing the RSA private key for the client user.
 
         username: A string containing the username input by the client user.
 
@@ -105,17 +108,19 @@ def credentials_certificate_initialise(
 def credentials_key_initialise(
         user_private_key_filepath: str, username: str, user_password: str) -> rsa.RSAPrivateKey:
     """
-    The function ________________
+    The function initialises a RSA private key for the client user, either by decrypting an existing
+    key or by calling the credentials_key_generate function.
     
     Args:
-        user_private_key_filepath: ____________________________________
+        user_private_key_filepath: A string containing the filepath to the private key for the 
+        client user
     
         username: A string containing the username input by the client user.
 
         user_password: A string containing the password input by the client user.
 
     Returns:
-        An object ____________________________________
+        An object containing the RSA private key for the client user.
     """
 
     # Generate a user specific private key if one doesn't already exist
@@ -219,7 +224,8 @@ def credentials_key_generate(
     encryption.
     
     Args:
-        user_private_key_filepath: ____________________________________
+        user_private_key_filepath: A string containing the filepath to the private key for the 
+        client user
     
         username: A string containing the username input by the client user.
 
@@ -256,7 +262,7 @@ def csr_generate(username: str, user_private_key: rsa.RSAPrivateKey) -> str:
     Args:
         username: A string containing the username input by the client user.
     
-        user_private_key: An object _______________________________________________
+        user_private_key: An object containing the RSA private key for the client user.
 
     Returns:
         A string containing the file path for the generated csr.
@@ -366,7 +372,7 @@ def sfts_authenticate(
         ssl_conn: ssl.SSLSocket, username: str, password_hash: str, 
         host_address: str) -> tuple[str, str]:              
     """
-    This function ___________________________.
+    This function receives a nonce from the host server and in response authenticates with a HMAC.
 
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
@@ -750,19 +756,17 @@ def sfts_cmd_ls(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
 
 def sfts_cmd_update(ssl_conn: ssl.SSLSocket, username: str) -> None:
     """
-    This function ________________________________.
+    This function enables a client user to update the password used to authenticate with the SFTS 
+    service but confirming their existing password hash and registering a new password has with
+    the host server.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
 
-        username: ______________
+        username: A string containing the username input by the client user.
     """
 
     log.info(f"Initiated the update command.")
-
-###################################################################################################
-######################################## NOT YET DEVELOPED ########################################
-###################################################################################################
 
 def sfts_cmd_upload(ssl_conn: ssl.SSLSocket, user_private_key: rsa.RSAPrivateKey, username: str, 
                     host_address: str) -> None:
@@ -772,7 +776,7 @@ def sfts_cmd_upload(ssl_conn: ssl.SSLSocket, user_private_key: rsa.RSAPrivateKey
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
 
-        user_private_key: ________________________.
+        user_private_key: An object containing the RSA private key for the client user.
 
         username: A string containing the username input by the client user.
 
@@ -902,14 +906,17 @@ def sfts_connection(
         user_private_key_filepath: str, username: str, user_password: str, password_hash: str, 
         host_address: str) -> None:
     """
-    This function _________________________________________________________
+    This function establishes a mutually authenticated TLS connection with the host server and 
+    then calls authentication, authorisation and SFTS operation functions.
 
     Args:
-        host_certificate_filepath: ___________
+        host_certificate_filepath: A string containing the filepath to the CA and server 
+        certificates for the specified host server.
 
-        user_private_key: ___________________
+        user_private_key: An object containing the RSA private key for the client user.
 
-        user_private_key_filepath: ___________
+        user_private_key_filepath: A string containing the filepath to the private key for the 
+        client user.
 
         username: A string containing the username input by the client user.
 
@@ -971,9 +978,9 @@ def sfts_operations(ssl_conn: ssl.SSLSocket, user_private_key: rsa.RSAPrivateKey
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
 
-        user_private_key: __________________________
+        user_private_key: An object containing the RSA private key for the client user.
 
-        host_address: ________________________________________
+        host_address: A string containing the host server's IP address.
 
         username: A string containing the username input by the client user.
 

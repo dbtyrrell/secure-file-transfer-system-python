@@ -10,13 +10,14 @@ import hmac
 import json
 import logging
 import os
+from pathlib import Path
 import socket
 import ssl
 import sys
 import threading
 
 # Global variables
-HOST: str = "127.0.0.1"                                                                     #"10.16.10.155"
+HOST: str = "0.0.0.0"
 HOST_CODE: str = "9d695442d1ccee8313ff7f7eaa1566cbe6b32fa4c9e80f7ebd68a36d8df83f5a"
 SFTS_PORT: int = 8443
 CSR_PORT: int = 8444
@@ -25,13 +26,14 @@ BLOCK_DURATION: timedelta = timedelta(hours=24)
 DELAY_TOLERANCE: timedelta = timedelta(seconds=30)
 TERMINATOR: bytes = b"!_end_!"
 
-CERTIFICATES: str = "/workspaces/secure-file-transfer-system-python/certificates/"
-DIRECTORY: str = "/workspaces/secure-file-transfer-system-python/directory/"
-AUTH_FAILURES: str = "/workspaces/secure-file-transfer-system-python/src/auth_failures.json"
-BLOCKED_IP: str = "/workspaces/secure-file-transfer-system-python/src/blocked_ip.json"
-BLOCKED_PASSWORDS: str = "/workspaces/secure-file-transfer-system-python/src/blocked_passwords.json"
-ROLES: str = "/workspaces/secure-file-transfer-system-python/src/roles.json"
-USERS: str = "/workspaces/secure-file-transfer-system-python/src/users.json"
+SFTS_ROOT = str(Path(__file__).resolve().parent.parent)
+CERTIFICATES: str = os.path.join(SFTS_ROOT, "certificates")
+DIRECTORY: str = os.path.join(SFTS_ROOT, "directory")
+AUTH_FAILURES: str = os.path.join(SFTS_ROOT, "src/auth_failures.json")
+BLOCKED_IP: str = os.path.join(SFTS_ROOT, "src/blocked_ip.json")
+BLOCKED_PASSWORDS: str = os.path.join(SFTS_ROOT, "src/blocked_passwords.json")
+ROLES: str = os.path.join(SFTS_ROOT, "src/roles.json")
+USERS: str = os.path.join(SFTS_ROOT, "src/users.json")
 
 # Configure logging protocol
 logging.basicConfig(
@@ -70,7 +72,7 @@ users_file_lock = threading.Lock()
 # Initialise user role permissions
 roles = {}
 with roles_file_lock:
-    try:        
+    try:
         with open(ROLES, "r") as file:
             roles = json.load(file)
 
@@ -545,9 +547,9 @@ def sfts_authenticate(
 
     Returns:
         A tuple containing a bool defining whether the user passed SFTS authentication, a string 
-        containing the username submitted by the client and a string _____________________________________________
-        ______This function returns the role assigned to the user in the users.json file. Users not listed in the users.json file are assigned the default 'unregistered' role title.
-
+        containing the username submitted by the client and a string containing the role assigned to
+        the user in the users.json file. Users not listed in the users.json file are assigned the 
+        default 'unregistered' role title.
     """
 
     try:
@@ -841,7 +843,9 @@ def sfts_cmd_ls(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username:
 
 def sfts_cmd_update(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username: str) -> None:
     """
-    This function uploads a file from the client directory to the host server directory.
+    This function enables a client user to update the password used to authenticate with the SFTS 
+    service but confirming their existing password hash and registering a new password has with
+    the host server.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
@@ -852,10 +856,6 @@ def sfts_cmd_update(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], usern
     """
 
     log.info(f"Client {username} {client_addr} initiated the update command.")
-
-###################################################################################################
-######################################## NOT YET DEVELOPED ########################################
-###################################################################################################
 
 def sfts_cmd_upload(
         ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], server_key: object, username: str, 
@@ -1130,9 +1130,9 @@ def sfts_connection(
         conn: socket.socket, client_addr: tuple[str, int], password: str, 
         server_key: object) -> None:
     """
-    This function establishes SSL connections with clients and initiates authentication,
-    authorisation and SFTS operation functions.
-    
+    This function establishes mutually authenticated TLS connections with clients and then calls
+    authentication, authorisation and SFTS operation functions.
+
     Args:
         conn: A socket connection object enabling binary transfer.
 
@@ -1245,7 +1245,7 @@ def sfts_listen(password: str, server_key: object) -> None:
         try:
             sock.bind((HOST, SFTS_PORT))
             sock.listen(5)
-            log.info(f"SFTS service bound to {HOST}:{SFTS_PORT}.")
+            log.info(f"SFTS service listening on {HOST}:{SFTS_PORT}.")
 
         except Exception as e:
             log.critical(f"SFTS error: Failed to bind SFTS service to port {SFTS_PORT}. {e}.")
@@ -1339,6 +1339,15 @@ def sfts_operations(
                       " permissions.")
             continue
 
+        # Validate that the filename doesn't contain indicators of a directory traversal attack
+        try:
+            filename = traversal_prevention(filename)
+        
+        except ValueError:
+            log.error(f"Command error: Potential directory traversal attempt from client {username}"
+                      f"{client_addr}.")
+            continue
+
         # Action client command
         if cmd == "delete":
             sfts_cmd_delete(ssl_conn, client_addr, username, filename)
@@ -1394,6 +1403,38 @@ def timestamp_validation(timestamp: object, client_addr: tuple[str, int], userna
     except Exception as e:
         log.error(f"Timestamp error: Client {username} {client_addr} validation failure. {e}.")
         return False
+
+def traversal_prevention(filename: str) -> str:
+    """
+    This function evaluates a string containing a filename received from a client users and raises a
+    ValueError if that filename contains indicators of a directory traversal attempt.
+
+    Args:
+        filename: A string containing the filename specified by the client user.
+
+    Returns:
+        A filename that doesn't contain ascii characters used for directory traversal as a string.
+    """
+
+    # Remove whitespaces from filenames
+    filename = filename.strip()
+
+    # Reject empty filenames
+    if not filename or filename == ".":
+        raise ValueError("Directory traversal risk")
+
+    # Reject filenames with absolute filepaths
+    if os.path.isabs(filename):
+        raise ValueError("Directory traversal risk")
+
+    # Normalise filename
+    valid_filename = os.path.normpath(filename)
+    
+    # Reject filenames with ascii characters used for directory traversal [note "/" is permitted]
+    if valid_filename.startswith("..") or "\\" in valid_filename:
+        raise ValueError("Directory traversal risk")
+
+    return valid_filename
 
 def write_auth_failures(auth_failures: dict) -> None:
     """
