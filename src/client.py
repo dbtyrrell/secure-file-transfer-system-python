@@ -40,7 +40,7 @@ os.makedirs(CERTIFICATES, exist_ok = True)
 os.makedirs(DIRECTORY, exist_ok = True)
 if not os.path.exists(BLOCKED_PASSWORDS):
     with open(BLOCKED_PASSWORDS, 'w') as file:
-        json.dump({}, file)
+        json.dump([], file)
 if not os.path.exists(ROLES):
     with open(ROLES, 'w') as file:
         json.dump({}, file)
@@ -50,6 +50,7 @@ blocked_passwords_file_lock = threading.Lock()
 roles_file_lock = threading.Lock()
 
 # Initialise user role permissions
+roles = {}
 with roles_file_lock:
     try:        
         with open(ROLES, "r") as file:
@@ -168,7 +169,7 @@ def credentials_input_host() -> tuple[str, str]:
 
     return host_address, host_hash
 
-def credentials_input_user() -> list[str, str, str]:
+def credentials_input_user() -> tuple[str, str, str]:
     """
     This function obtains user input to initialise their username and password.
                 
@@ -378,7 +379,8 @@ def sfts_authenticate(
         host_address: A string containing the host server's IP address.
 
     Returns:
-        A string containing the user role provided by the host server. 
+        A tuple containing a bool that is True if the client users passed authentication, else 
+        False, and the user role provided by the host server as a string. 
     """
     
     # Receive 256 bit nonce from host server
@@ -410,9 +412,9 @@ def sfts_authenticate(
 
     ssl_conn.sendall(client_hmac)
 
-    # Send username to host server
-    username_bytes = username.encode() + b"\n"
-    ssl_conn.sendall(username_bytes)
+    # Send username and password hash to host server
+    credentials_bytes = f"{username}|{password_hash}\n".encode()
+    ssl_conn.sendall(credentials_bytes)
 
     # Receive authentication result and user role from host server 
     results_bytes = b""
@@ -432,7 +434,12 @@ def sfts_authenticate(
         return False, "unregistered"
 
     header_line, remainder = results_bytes.split(b"\n",1)
-    result, user_role = header_line.decode().split("|",1)
+    result_string, user_role = header_line.decode().split("|",1)
+
+    if result_string.lower() == "true":
+        result = True
+    else:
+        result = False
 
     return result, user_role
 
@@ -448,7 +455,7 @@ def sfts_cmd_delete(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
 
     log.info(f"Initiated the delete command.")
     
-    filename = str(input("File to be deleted:").strip())
+    filename = str(input("File to be deleted: ").strip())
 
     # Send command to host server
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -492,7 +499,7 @@ def sfts_cmd_download(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
     log.info(f"Initiated the download command.")
 
     while True:
-        filename = str(input("File to be downloaded:").strip())
+        filename = str(input("File to be downloaded: ").strip())
         if filename:
             break
         print("Invalid filename")
@@ -544,18 +551,18 @@ def sfts_cmd_download(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
 
     # Initialise JSON header contents
     try:
-        filename = header["filename"],
-        filesize = int(header["filesize"]),
-        hash_alg = header["hash_algorith"],
-        file_hash = header["file_has"]
-        signed = header["signed"],
-        signature = header["signature"],
+        filename = header["filename"]
+        filesize = int(header["filesize"])
+        hash_alg = header["hash_algorith"]
+        file_hash = header["file_hash"]
+        timestamp = header["timestamp"]
+        signature = header["signature"]
 
     except KeyError as e:
         log.error(f"Command error: Missing download cmd header contents. {e}")
         return
 
-    # Print error messages if SHA256 wasn't used to generate the hash.
+    # Validate JSON header hash algorithm
     if hash_alg.upper() != "SHA256":
         log.error(f"Command error: Unrecognised hash algorithm. {hash_alg}")
 
@@ -568,10 +575,11 @@ def sfts_cmd_download(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
         server_public_key = server_certificate.public_key()
 
     except Exception as e:
-        log.error(f"Signature error: Server private key couldn't be initialised. {e}.")
+        log.error(f"Signature error: Server public key couldn't be initialised. {e}.")
+        return
 
     # Validate signature
-    header_data = f"{filename}|{filesize}|{hash_alg}|{signed}"
+    header_data = f"{filename}|{filesize}|{hash_alg}|{timestamp}".encode("utf-8")
     try:
         signature = base64.b64decode(signature)
         server_public_key.verify(
@@ -581,7 +589,7 @@ def sfts_cmd_download(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
                 mgf = padding.MGF1(hashes.SHA256()),
                 salt_length = padding.PSS.MAX_LENGTH
             ),
-            hashes.SHA256
+            hashes.SHA256()
         )
 
         log.info(f"Signature validated for {filename} from host server {host_address}.")
@@ -609,7 +617,7 @@ def sfts_cmd_download(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
     remaining = filesize
 
     try:
-        with open(filepath) as file:
+        with open(filepath, "wb") as file:
             while remaining > 0:
                 chunk = ssl_conn.recv(min(4096, remaining))
                 if not chunk:
@@ -622,7 +630,7 @@ def sfts_cmd_download(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
     except Exception as e:
         log.error(f"Command error: {filename} download failed. {e}.")
 
-        # Attempt to remove fail downloads
+        # Attempt to remove failed downloads
         try:
             os.remove(filepath)
 
@@ -678,23 +686,25 @@ def sfts_cmd_help(user_role: str) -> None:
         user_role: A string containing the client user's role as advised by the host server.
     """
 
+    role_check = roles.get(user_role, {})
+
     print("\nThe following commands are available to you:\n")
 
-    if roles[user_role]["delete"]:
+    if role_check.get("delete", False):
         print("DELETE      Delete a file from the server directory")
 
-    if roles[user_role]["download"]:
+    if role_check.get("download", False):
         print("DOWNLOAD    Download a file from the server directory")
 
     print("EXIT        Exit program")
     print("HELP        View available commands")
 
-    if roles[user_role]["ls"]:
+    if role_check.get("ls", False):
         print("LS          List all files within the server directory")
 
     print("UPDATE      Update your personal user details")
 
-    if roles[user_role]["upload"]:
+    if role_check.get("upload", False):
         print("UPLOAD      Upload a file to the server directory")
 
 def sfts_cmd_ls(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
@@ -772,7 +782,7 @@ def sfts_cmd_upload(ssl_conn: ssl.SSLSocket, user_private_key: rsa.RSAPrivateKey
     log.info(f"Initiated the upload command.")
 
     while True:
-        filename = str(input("File to be uploaded:").strip())
+        filename = str(input("File to be uploaded: ").strip())
         if filename:
             break
         print("Invalid filename")
@@ -831,11 +841,11 @@ def sfts_cmd_upload(ssl_conn: ssl.SSLSocket, user_private_key: rsa.RSAPrivateKey
         "filename": filename,
         "filesize": filesize,
         "hash_algorith": "SHA256",
-        "file_hash": client_hash,
-        "signed": timestamp,
+        "file_hash": file_hash,
+        "timestamp": timestamp,
         "signature": base64.b64encode(signature).decode("ascii")
     }
-    header_bytes = json.dumps(header, seperators = (",", ":")).encode("utf-8") + TERMINATOR
+    header_bytes = json.dumps(header, separators = (",", ":")).encode("utf-8") + TERMINATOR
 
     # Send command to host server
     timestamp = datetime.now(timezone.utc).isoformat()

@@ -1,14 +1,1 @@
-base64
-cryptography
-datetime
-getpass
-hashlib
-hmac
-ipaddress
-json
-logging
-os
-socket
-ssl
-sys
-threading
+cryptography >= 46.0.0

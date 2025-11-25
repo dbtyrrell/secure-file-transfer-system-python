@@ -16,7 +16,7 @@ import sys
 import threading
 
 # Global variables
-HOST: str = "127.0.0.1"                                                                     #"10.16.10.247"
+HOST: str = "127.0.0.1"                                                                     #"10.16.10.155"
 HOST_CODE: str = "9d695442d1ccee8313ff7f7eaa1566cbe6b32fa4c9e80f7ebd68a36d8df83f5a"
 SFTS_PORT: int = 8443
 CSR_PORT: int = 8444
@@ -52,7 +52,7 @@ if not os.path.exists(BLOCKED_IP):
         json.dump({}, file)
 if not os.path.exists(BLOCKED_PASSWORDS):
     with open(BLOCKED_PASSWORDS, 'w') as file:
-        json.dump({}, file)
+        json.dump([], file)
 if not os.path.exists(ROLES):
     with open(ROLES, 'w') as file:
         json.dump({}, file)
@@ -68,6 +68,7 @@ roles_file_lock = threading.Lock()
 users_file_lock = threading.Lock()
 
 # Initialise user role permissions
+roles = {}
 with roles_file_lock:
     try:        
         with open(ROLES, "r") as file:
@@ -275,6 +276,7 @@ def csr_listen(ca_key: object) -> None:
 
         except Exception as e:
             log.critical(f"CSR error: Port {CSR_PORT} binding failure. {e}.")
+            sys.exit(1)
 
         # Initialise placeholder client address to prevent exception reporting errors
         client_addr = ("unknown",0)
@@ -424,7 +426,7 @@ def read_auth_failures() -> dict:
 
     with auth_failures_file_lock:
         try:
-            if not os.path.exists(AUTH_FAILURES):
+            if not os.path.exists(AUTH_FAILURES) or os.path.getsize(AUTH_FAILURES) == 0:
                 return {}
             
             with open(AUTH_FAILURES, "r") as file:
@@ -445,7 +447,7 @@ def read_blocked_ip() -> dict:
 
     with blocked_ip_file_lock:
         try:
-            if not os.path.exists(BLOCKED_IP):
+            if not os.path.exists(BLOCKED_IP) or os.path.getsize(BLOCKED_IP) == 0:
                 return {}
             
             with open(BLOCKED_IP, "r") as file:
@@ -455,18 +457,18 @@ def read_blocked_ip() -> dict:
             log.error(f"Blocked IP file error: Failed to read from file. {e}.")
             return {}
 
-def read_blocked_passwords() -> list:
+def read_blocked_passwords() -> list[str]:
     """
     This function initialises the content of the blocked_ip.json file as a dictionary, mapping 
     client IP addresses to a timestamp of when the IP block will expire.
         
     Returns:
-        A dictionary containing the details of all client users.
+        A list containing blocked passwords as strings.
     """
 
     with blocked_passwords_file_lock:
         try:
-            if not os.path.exists(BLOCKED_PASSWORDS):
+            if not os.path.exists(BLOCKED_PASSWORDS) or os.path.getsize(BLOCKED_PASSWORDS) == 0:
                 return []
             
             with open(BLOCKED_PASSWORDS, "r") as file:
@@ -487,7 +489,7 @@ def read_users() -> dict:
 
     with users_file_lock:
         try:
-            if not os.path.exists(USERS):
+            if not os.path.exists(USERS) or os.path.getsize(USERS) == 0:
                 return {}
             
             with open(USERS, "r") as file:
@@ -529,10 +531,6 @@ def register_auth_failure(ip: str) -> None:
             f"Authentication error: Client {ip} has {len(ip_failures)} and has been blocked for"
             f"{BLOCK_DURATION}"
         )
-
-    # Reset authentication failure tracking
-    failures[ip] = []
-    write_auth_failures(failures)
 
 def sfts_authenticate(
         ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int]) -> tuple[bool, str, str]:
@@ -595,7 +593,11 @@ def sfts_authenticate(
             return False, "unknown", "unregistered"
 
         header_line, remainder = username_bytes.split(b"\n",1)
-        username = header_line.decode().strip()
+        try:
+            username, password_hash = header_line.decode().strip().split("|", 1)
+        except ValueError:
+            log.error(f"SFTS error: Invalid credential format sent by client {client_addr}.")
+            return False, "unknown", "unregistered"
 
         # Initialise client variables
         users = read_users()
@@ -605,22 +607,22 @@ def sfts_authenticate(
             # Register first time users
             user_role = "registered"
             users[username] = {
-                "hash":client_hmac, 
-                "role":user_role, 
-                "created":timestamp,
-                "modified":timestamp
+                "hash": password_hash, 
+                "role": user_role, 
+                "created": timestamp,
+                "modified": timestamp
                 }
             write_users(users)
             log.info(f"New user registration: Client {username} {client_addr}.")
 
         else:
             # Initialise credentials for returning client users
-            password_hash = users[username]["hash"]
+            stored_hash = users[username]["hash"]
             user_role = users[username]["role"]
 
             # Authenticate HMAC received from returning client users
             server_hmac = hmac.new(
-                key = password_hash.encode(),
+                key = stored_hash.encode(),
                 msg = nonce,
                 digestmod = hashlib.sha256
             ).hexdigest()
@@ -684,7 +686,7 @@ def sfts_cmd_delete(
     # Validate filepath
     filepath = os.path.join(DIRECTORY, filename)
     if not os.path.exists(filepath):
-        log.error(f"Command error: Client {username} {client_addr} download failed."
+        log.error(f"Command error: Client {username} {client_addr} delete failed."
                   "Filename doesn't exist.")
         msg = b"Error: Invalid filename." + TERMINATOR
         ssl_conn.sendall(msg)
@@ -694,12 +696,12 @@ def sfts_cmd_delete(
     try:
         os.remove(filepath)
         log.info(f"Client {username} {client_addr} deleted {filepath}.")
-        msg = (f"{filename} deleted.{TERMINATOR}").encode()
+        msg = f"{filename} deleted.".encode() + TERMINATOR
         ssl_conn.sendall(msg)
 
     except Exception as e:
         log.error(f"Command error: Client {username} {client_addr} delete failure {filepath}. {e}.")
-        msg = b"Error: Unable to delete {filename}." + TERMINATOR
+        msg = f"Error: Unable to delete {filename}.".encode() + TERMINATOR
         ssl_conn.sendall(msg)
 
 def sfts_cmd_download(
@@ -775,10 +777,10 @@ def sfts_cmd_download(
             "filesize": filesize,
             "hash_algorith": "SHA256",
             "file_hash": file_hash,
-            "signed": timestamp,
+            "timestamp": timestamp,
             "signature": base64.b64encode(signature).decode("ascii")
         }
-        header_bytes = json.dumps(header, seperators = (",", ":")).encode("utf-8") + TERMINATOR
+        header_bytes = json.dumps(header, separators = (",", ":")).encode("utf-8") + TERMINATOR
 
         # Send JSON header to client
         ssl_conn.sendall(header_bytes)
@@ -796,7 +798,7 @@ def sfts_cmd_download(
     except Exception as e:
         log.error(f"Command error: Client {username} {client_addr} download failure for"
                   f"{filepath}. {e}.")
-        msg = {"Error": f"Unable to delete {filename}."}
+        msg = {"Error": f"Unable to download {filename}."}
         
         try:
             ssl_conn.sendall(json.dumps(msg).encode() + TERMINATOR)
@@ -835,7 +837,7 @@ def sfts_cmd_ls(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username:
         except Exception:
             pass
 
-        log.error(f"Command error: Client {username} {client_addr} list failure {file_list}. {e}.")
+        log.error(f"Command error: Client {username} {client_addr} list failure. {e}.")
 
 def sfts_cmd_update(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username: str) -> None:
     """
@@ -875,192 +877,254 @@ def sfts_cmd_upload(
 
     log.info(f"Client {username} {client_addr} initiated the upload command.")
 
+    if not filename:
+        log.error(f"Command error: Client {username} {client_addr} upload failed as a filename"
+        "wasn't provided.")
 
+        response = {"status": "error", "message": "Command error: Filename not specified."}    
 
+        try:
+            ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
 
+        except Exception:
+            pass
 
+        return
 
+    filepath = os.path.join(DIRECTORY, filename)
 
+    # Prevent accidental overwrites caused by name conflicts
+    if os.path.exists(filepath):
+        log.info(f"Command error: Client {username} {client_addr} upload failed as {filename}"
+                 f"already exists in {DIRECTORY}.\n")
 
+        response = {"status": "error", "message": "Command error: Filename already exists."}    
 
+        try:
+            ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
 
+        except Exception:
+            pass
 
+        return
 
+    # Receive JSON header from client (filesize limit of 64KB)
+    buffer = b""
+    max_bytes = 64 * 1024
 
+    try:
+        while TERMINATOR not in buffer:
+            chunk = ssl_conn.recv(4096)
+            if not chunk:
+                log.error(f"Command error: Client {username} {client_addr} closed connection"
+                          "prematurely.")
+                raise ConnectionError("Connection closed before completion of upload command.")
 
+            buffer += chunk
 
+            if len(buffer) > max_bytes:
+                log.error(f"Command error: Invalid header size received from client {username}"
+                          f"{client_addr}.")
 
+                return
 
+    except Exception as e:
+        response = {"status": "error", "message": "Command error: Header not received."} 
+        try:
+            ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
 
+        except Exception:
+            pass
 
+        log.error(f"Command error: Header not received from client {username} {client_addr}. {e}.")
+        return
 
+    header_bytes, remainder = buffer.split(TERMINATOR, 1)
 
+    # Decode JSON header
+    try:
+        header = json.loads(header_bytes.decode("utf-8"))
 
-    # while True:
-    #     filename = str(input("File to be downloaded:").strip())
-    #     if filename:
-    #         break
-    #     print("Invalid filename")
+    except json.JSONDecodeError:
+        log.error(f"Command error: Unable to decode JSON header.")
 
-    # filepath = os.path.join(DIRECTORY, filename)
+        response = {"status": "error", "message": "Command error: Invalid header."} 
+        try:
+            ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
 
-    # # Prevent accidental overwrites caused by name conflicts
-    # if os.path.exists(filepath):
-    #     log.info(f"A file named {filename} already exists in {DIRECTORY}.\n")
+        except Exception:
+            pass
 
-    #     # Obtain user permission to overwrite or cancel download request
-    #     user_choice = str(input(
-    #         "Type 'Yes' to overwrite the existing file or type any other key to cancel: ").strip())
-        
-    #     if user_choice.lower() != "yes":
-    #         log.info(f"Client {username} cancelled download to prevent overwrite of {filepath}")
-    #         return
-        
-    #     log.info(f"Client {username} elected to overwrite {filepath}")
+        return
 
-    # # Send command to host server
-    # timestamp = datetime.now(timezone.utc).isoformat()
-    # msg = (f"download|{filename}|{timestamp}\n").encode()
-    # ssl_conn.sendall(msg)
+    # Initialise JSON header contents
+    try:
+        header_filename = header["filename"]
+        filesize = int(header["filesize"])
+        hash_alg = header["hash_algorith"]
+        file_hash = header["file_hash"]
+        timestamp = header["timestamp"]
+        signature = header["signature"]
 
-    # # Receive filesize information from host server
-    # try:
-    #     buffer = sfts_response(ssl_conn, host_address)
+    except KeyError as e:
+        log.error(f"Command error: Missing upload command header contents. {e}")
 
-    # except (ConnectionError, ValueError) as e:
-    #     log.error(f"Command error: Failed to receive response from host server {host_address}")
-    #     return
+        response = {"status": "error", "message": "Command error: Incomplete header."} 
+        try:
+            ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
+
+        except Exception:
+            pass
+
+        return
 
-    # # Isolate JSON header in host server response
-    # header_bytes, _ = buffer.split(TERMINATOR,1)
-
-    # # Decode JSON header
-    # try:
-    #     header = json.loads(header_bytes.decode("utf-8"))
-
-    # except json.JSONDecodeError as e:
-    #     log.error(f"")
-    #     return
-
-    # # Print error messages if required
-    # if "Error" in header:
-    #     print(header["Error"])
-    #     return
-
-    # # Initialise JSON header contents
-    # try:
-    #     filename = header["filename"],
-    #     filesize = int(header["hash_algorith"]),
-    #     hash_alg = header["file_hash"],
-    #     signed = header["signed"],
-    #     signature = header["signature"],
-
-    # except KeyError as e:
-    #     log.error(f"Command error: Missing download cmd header contents. {e}")
-    #     return
-
-    # # Print error messages if SHA256 wasn't used to generate the hash.
-    # if hash_alg.upper() != "SHA256":
-    #     log.error(f"Command error: Unrecognised hash algorithm. {hash_alg}")
-
-    # # Extract and initilaise the server public key from the server certificate
-    # try:
-    #     der_certificate = ssl_conn.getpeercert(binary_form = True)
-    #     if not der_certificate:
-    #         raise ValueError("Server certificate couldn't be initialised")
-    #     server_certificate = x509.load_der_x509_certificate(der_certificate)
-    #     server_public_key = server_certificate.public_key()
-
-    # except Exception as e:
-    #     log.error(f"Signature error: Server private key couldn't be initialised. {e}.")
-
-    # header_data = f"{filename}|{filesize}|{hash_alg}|{signed}"
-
-    # # Validate signature
-    # try:
-    #     signature = base64.b64decode(signature)
-    #     server_public_key.verify(
-    #         signature,
-    #         header_data,
-    #         padding.PSS(
-    #             mgf = padding.MGF1(hashes.SHA256()),
-    #             salt_length = padding.PSS.MAX_LENGTH
-    #         ),
-    #         hashes.SHA256
-    #     )
-
-    #     log.info(f"Signature validated for {filename} from host server {host_address}.")
-
-    # # Discard excess data in the event on an error processing header
-    # except Exception as e:
-    #     log.error(f"Signature error: Unable to validate signature for {filename} from host server"
-    #               f"{host_address}.")
-
-    #     remaining = filesize
-    #     try:
-    #         while remaining > 0:
-    #             chunk = ssl_conn.recv(min(4096, remaining))
-    #             if not chunk:
-    #                 break
-    #             remaining -= len(chunk)
-
-    #     except Exception:
-    #         pass
-
-    # # Receive file from host server while incrementally 
-    # received_hash = hashlib.sha256()
-    # remaining = filesize
-
-    # try:
-    #     with open(filepath) as file:
-    #         while remaining > 0:
-    #             chunk = ssl_conn.recv(min(4096, remaining))
-    #             if not chunk:
-    #                 log.error(f"Command error: Connection with {host_address} lost during download")
-    #                 raise ConnectionError(f"Connection lost during download")
-    #             file.write(chunk)
-    #             received_hash.update(chunk)
-    #             remaining -= len(chunk)
-
-    # except Exception as e:
-    #     log.error(f"Command error: {filename} download failed. {e}.")
-
-    #     # Attempt to remove fail downloads
-    #     try:
-    #         os.remove(filepath)
-
-    #     except Exception:
-    #         pass
-
-    #     return
-
-    # # Verify download file integrity using host server provided hash and client generated hash
-    # client_hash = received_hash.hexdigest()
-    # if received_hash != client_hash:
-    #     log.error(f"Command error: {filename} failed hash verification.")
-
-    #     # Attempt to remove unverified downloads
-    #     try:
-    #         os.remove(filepath)
-
-    #     except Exception:
-    #         pass
-
-    #     return
-
-    # log.info(f"{filename} download and integrity verification successful.")
-
-
-
-
-
-
-
-
-
-
-
-
+    # Validate JSON header filename
+    if header_filename != filename:
+        log.error(f"Command error: Incorrect filename listed in JSON header.")
+        response = {"status": "error", "message": "Command error: Filename mismatch."} 
+        try:
+            ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
+
+        except Exception:
+            pass
+
+        return
+
+    # Validate JSON header hash algorithm
+    if hash_alg.upper() != "SHA256":
+        log.error(f"Command error: Unrecognised hash algorithm. {hash_alg}")
+        response = {"status": "error", "message": "Command error: Unrecognised hash algorithm."} 
+        try:
+            ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
+
+        except Exception:
+            pass
+
+        return
+
+    # Extract and initilaise the client public key from the client certificate
+    try:
+        der_certificate = ssl_conn.getpeercert(binary_form = True)
+        if not der_certificate:
+            raise ValueError("Client certificate couldn't be initialised")
+        client_certificate = x509.load_der_x509_certificate(der_certificate)
+        client_public_key = client_certificate.public_key()
+
+    except Exception as e:
+        log.error(f"Signature error: Client private key couldn't be initialised. {e}.")
+        response = {"status": "error", "message": "Command error: Client public key error."} 
+        try:
+            ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
+
+        except Exception:
+            pass
+
+        return
+
+    # Validate signature
+    header_data = f"{filename}|{filesize}|{hash_alg}|{timestamp}".encode("utf-8")
+    try:
+        signature = base64.b64decode(signature)
+        client_public_key.verify(
+            signature,
+            header_data,
+            padding.PSS(
+                mgf = padding.MGF1(hashes.SHA256()),
+                salt_length = padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+
+        log.info(f"Signature validated for {filename} from Client {username} {client_addr}.")
+
+    except Exception as e:
+        log.error(f"Signature error: Unable to validate signature for {filename} from Client"
+                  f"{username} {client_addr}.")
+        response = {"status": "error", "message": "Command error: Unable to validate signature."} 
+        try:
+            ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
+
+            # Discard excess data in the event on an error processing header
+            remaining = filesize
+
+            while remaining > 0:
+                chunk = ssl_conn.recv(min(4096, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+
+        except Exception:
+            pass
+
+        return
+
+    # Receive file from host server while incrementally 
+    server_hash = hashlib.sha256()
+    remaining = filesize
+
+    try:
+        with open(filepath, "wb") as file:
+            while remaining > 0:
+                chunk = ssl_conn.recv(min(4096, remaining))
+                if not chunk:
+                    log.error(f"Command error: Connection with client {username} {client_addr} lost"
+                              "during download")
+                    raise ConnectionError(f"Connection lost during download")
+                file.write(chunk)
+                server_hash.update(chunk)
+                remaining -= len(chunk)
+
+    except Exception as e:
+        log.error(f"Command error: {filename} upload failed. {e}.")
+
+        # Attempt to remove failed uploads
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+
+        except Exception:
+            pass
+
+        response = {"status": "error", "message": "Command error: Connection failure mid upload."} 
+        try:
+            ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
+
+        except Exception:
+            pass
+
+        return
+
+    # Verify upload file integrity using client provided hash and host server generated hash
+    server_hash.hexdigest()
+    if server_hash.hexdigest() != file_hash:
+        log.error(f"Command error: {filename} failed hash verification.")
+
+        # Attempt to remove unverified downloads
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+
+        except Exception:
+            pass
+
+        response = {"status": "error", "message": "Command error: Hash verification failure."} 
+        try:
+            ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
+
+        except Exception:
+            pass
+
+        return
+
+    response = {"status": "success", "message": f"{filename} upload successful."} 
+    try:
+        ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
+
+    except Exception:
+        log.error(f"Command error: Failed to send success message to client {username}"
+                  f"{client_addr}.")
+
+    log.info(f"{filename} upload and integrity verification successful.")
 
 def sfts_connection(
         conn: socket.socket, client_addr: tuple[str, int], password: str, 
@@ -1185,6 +1249,7 @@ def sfts_listen(password: str, server_key: object) -> None:
 
         except Exception as e:
             log.critical(f"SFTS error: Failed to bind SFTS service to port {SFTS_PORT}. {e}.")
+            sys.exit(1)
 
         # Initialise placeholder client address to prevent variable errors in exception reporting
         client_addr = ("unknown",0)
@@ -1411,3 +1476,4 @@ if __name__ == "__main__":
 
     except Exception as e:
         log.critical(f"Fatal error: {e}.")
+        sys.exit(1)
