@@ -345,20 +345,42 @@ def csr_send(csr_path: str, username: str, host_address: str, host_hash: str) ->
         # Notify user of completed CSR send
         log.info(f"CSR sent to host server {host_address}:{CSR_PORT}.")
 
-        # Receive signed server certificate
-        signed_certificate = b""
+        # Receive CA and client certificates from host server
+        signed_certificates = b""
         while True:
             chunk = csr_sock.recv(4096)
             if not chunk:
                 break
-            signed_certificate += chunk
+            signed_certificates += chunk
 
-    # Save signed server certificate
-    with open(signed_certificate_path, "wb") as file:
-        file.write(signed_certificate)
+    # Split CA and client certificates
+    try:
+        ca_certificate_bytes, signed_certificate_bytes = signed_certificates.split(TERMINATOR, 1)
+
+    except ValueError:
+        log.error("CSR error: Terminator not found in signed certificates.")
+        return
+
+    # Write CA certificate
+    ca_certificate_path = os.path.join(CERTIFICATES, "ca_certificate.pem")
+    try:
+        with open(ca_certificate_path, "wb") as file:
+            file.write(ca_certificate_bytes)
+            log.info(f"CA certificate saved to {ca_certificate_path}.")
+    
+    except Exception as e:
+        log.error(f"CSR error: Unable to write CA certificate. {e}.")
+
+    # Write client certificate
+    try:
+        with open(signed_certificate_path, "wb") as file:
+            file.write(signed_certificate_bytes)
+
+    except Exception as e:
+        log.error(f"CSR error: Unable to write client certificate. {e}.")
 
     # Notify user of completed CSR send
-    log.info(f"Signed certificate recieved from host server {host_address}.")
+    log.info(f"Signed CA and client certificates recieved from host server {host_address}.")
 
     # Delete now redundant CSR
     try:
@@ -534,13 +556,13 @@ def sfts_cmd_download(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
     # Receive filesize information from host server
     try:
         buffer = sfts_response(ssl_conn, host_address)
-
+        
     except (ConnectionError, ValueError) as e:
         log.error(f"Command error: Failed to receive response from host server {host_address}")
         return
 
     # Isolate JSON header in host server response
-    header_bytes, _ = buffer.split(TERMINATOR,1)
+    header_bytes, remainder = buffer.split(TERMINATOR,1)
 
     # Decode JSON header
     try:
@@ -585,7 +607,7 @@ def sfts_cmd_download(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
         return
 
     # Validate signature
-    header_data = f"{filename}|{filesize}|{hash_alg}|{timestamp}".encode("utf-8")
+    header_data = f"{filename}|{filesize}|{file_hash}|{timestamp}".encode("utf-8")
     try:
         signature = base64.b64decode(signature)
         server_public_key.verify(
@@ -601,7 +623,7 @@ def sfts_cmd_download(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
         log.info(f"Signature validated for {filename} from host server {host_address}.")
 
     except Exception as e:
-        log.error(f"Signature error: Unable to validate signature for {filename} from host server"
+        log.error(f"Signature error: Unable to validate signature for {filename} from host server "
                   f"{host_address}.")
 
         # Discard excess data in the event on an error processing header
@@ -624,6 +646,13 @@ def sfts_cmd_download(ssl_conn: ssl.SSLSocket, host_address: str) -> None:
 
     try:
         with open(filepath, "wb") as file:
+            
+            # Account for body bytes delivered with header
+            if remainder:
+                file.write(remainder)
+                client_hash.update(remainder)
+                remaining -= len(remainder)
+
             while remaining > 0:
                 chunk = ssl_conn.recv(min(4096, remaining))
                 if not chunk:
@@ -931,7 +960,7 @@ def sfts_connection(
     # Configure SSL context
     context = ssl.create_default_context(
         ssl.Purpose.SERVER_AUTH, 
-        cafile = f"{CERTIFICATES}ca_certificate.pem"
+        cafile = os.path.join(CERTIFICATES, "ca_certificate.pem")
     )
     
     # Initialise SSL certificates and keys as local variables

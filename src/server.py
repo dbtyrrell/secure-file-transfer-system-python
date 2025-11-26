@@ -173,11 +173,30 @@ def csr_connection(
         # Sign CSR
         signed_certificate_path, username = csr_sign(csr_path, client_addr, ca_key)
 
-        # Send certificate to client
-        with open(signed_certificate_path, "rb") as file:
-            conn.sendall(file.read())
+        # Send CA and client certificates to client
+        ca_certificate_path = os.path.join(CERTIFICATES, "ca_certificate.pem")
         
-        log.info(f"Client {username} {client_addr} certificate sent.")
+        try:
+            with open(ca_certificate_path, "rb") as file:
+                ca_certificate_bytes = file.read()
+
+        except Exception as e:
+            log.error(f"CSR error: Unable to read CA certificate. {e}.")
+            return
+
+        try:
+            with open(signed_certificate_path, "rb") as file:
+                signed_certificate_bytes = file.read()
+
+        except Exception as e:
+            log.error(
+                f"CSR error: Unable to read client certificate for client {username} {client_addr}."
+                f"{e}.")
+            return   
+        
+        conn.sendall(ca_certificate_bytes + TERMINATOR + signed_certificate_bytes)
+
+        log.info(f"CA and client certificates sent to client {username} {client_addr}.")
 
     except Exception as e:
         log.error(f"CSR error: CSR failure for {client_addr}. {e}.")
@@ -363,12 +382,35 @@ def csr_sign(csr_path: str, client_addr: tuple[str, int], ca_key: object) -> tup
                 ),
                 critical = True
             )
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature = True,
+                    content_commitment = False,
+                    key_encipherment = True,
+                    data_encipherment = False,
+                    key_agreement = False,
+                    key_cert_sign = False,
+                    crl_sign = False,
+                    encipher_only = False,
+                    decipher_only = False
+                ),
+                critical = True
+            )
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(csr.public_key()),
+                critical = False
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_certificate.public_key()),
+                critical = False
+            )
             .sign(private_key = ca_key, algorithm = hashes.SHA256())
         )
 
     except Exception as e:
         log.error(
             f"CSR error: Failed to generate client {username} {client_addr} certificate. {e}.")
+        return "csr_failed", "csr_failed"
 
     # Initialise the client IP address as a variable that can be used for file naming
     client_ip = client_addr[0].replace(".","")
@@ -1023,7 +1065,7 @@ def sfts_cmd_upload(
         return
 
     # Validate signature
-    header_data = f"{filename}|{filesize}|{hash_alg}|{timestamp}".encode("utf-8")
+    header_data = f"{filename}|{filesize}|{file_hash}|{timestamp}".encode("utf-8")
     try:
         signature = base64.b64decode(signature)
         client_public_key.verify(
@@ -1065,6 +1107,13 @@ def sfts_cmd_upload(
 
     try:
         with open(filepath, "wb") as file:
+            
+            # Account for body bytes delivered with header
+            if remainder:
+                file.write(remainder)
+                server_hash.update(remainder)
+                remaining -= len(remainder)
+            
             while remaining > 0:
                 chunk = ssl_conn.recv(min(4096, remaining))
                 if not chunk:
@@ -1211,13 +1260,13 @@ def sfts_context(password: str) -> ssl.SSLContext:
 
         # Initilaise SSL certificates and keys as variables
         context.load_cert_chain(
-            certfile = f"{CERTIFICATES}server_certificate.pem", 
-            keyfile = f"{CERTIFICATES}server_key.pem",
+            certfile = os.path.join(CERTIFICATES, "server_certificate.pem"), 
+            keyfile = os.path.join(CERTIFICATES, "server_key.pem"),
             password = password
         )
 
         context.verify_mode = ssl.CERT_REQUIRED
-        context.load_verify_locations(f"{CERTIFICATES}ca_certificate.pem")
+        context.load_verify_locations(os.path.join(CERTIFICATES, "ca_certificate.pem"))
 
         log.info("SSL context initialisation success.")
         return context
