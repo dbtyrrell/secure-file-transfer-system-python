@@ -116,7 +116,8 @@ def csr_connection(
             authentication += chunk
 
             if len(authentication) > 4096:
-                log.error(f"CSR error: Incorrect authentication header received from {client_addr}.")
+                log.error(
+                    f"CSR error: Incorrect authentication header received from {client_addr}.")
                 raise ValueError("CSR authentication header error")
 
         if b"\n" not in authentication:
@@ -366,8 +367,8 @@ def csr_sign(csr_path: str, client_addr: tuple[str, int], ca_key: object) -> tup
         )
 
     except Exception as e:
-        log.error(f"CSR error: Failed to generate client {username} {client_addr} certificate. "
-                  f"{e}.")
+        log.error(
+            f"CSR error: Failed to generate client {username} {client_addr} certificate. {e}.")
 
     # Initialise the client IP address as a variable that can be used for file naming
     client_ip = client_addr[0].replace(".","")
