@@ -48,7 +48,7 @@ prevent exhaustion of server resources.
 - Directory traversal protection with type controls applied to all user inputs and validation of 
 filenames prior to execution of SFTS service commands.
 
-## Accounting
+### Accounting
 - Timestamped logging of info, errors and warnings for both clients and the host server.
 
 ## Implementation stack
