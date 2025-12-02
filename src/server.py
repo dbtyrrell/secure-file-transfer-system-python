@@ -16,19 +16,27 @@ import ssl
 import sys
 import threading
 
+# --------------------------------------------------------------------------- #
+# Configuration & globals
+# --------------------------------------------------------------------------- #
+
 # Global variables
 HOST: str = "0.0.0.0"
 HOST_CODE: str = "9d695442d1ccee8313ff7f7eaa1566cbe6b32fa4c9e80f7ebd68a36d8df83f5a"
+
 SFTS_PORT: int = 8443
 CSR_PORT: int = 8444
+
 BLOCK_WINDOW: timedelta = timedelta(hours=24)
 BLOCK_DURATION: timedelta = timedelta(hours=24)
 DELAY_TOLERANCE: timedelta = timedelta(seconds=30)
+
 TERMINATOR: bytes = b"!_end_!"
 
 SFTS_ROOT = str(Path(__file__).resolve().parent.parent)
 CERTIFICATES: str = os.path.join(SFTS_ROOT, "certificates")
 DIRECTORY: str = os.path.join(SFTS_ROOT, "directory")
+
 AUTH_FAILURES: str = os.path.join(SFTS_ROOT, "src/auth_failures.json")
 BLOCKED_IP: str = os.path.join(SFTS_ROOT, "src/blocked_ip.json")
 BLOCKED_PASSWORDS: str = os.path.join(SFTS_ROOT, "src/blocked_passwords.json")
@@ -46,44 +54,55 @@ log = logging.getLogger("SFTS_server")
 # Create required filepaths if they don't already exist
 os.makedirs(CERTIFICATES, exist_ok = True)
 os.makedirs(DIRECTORY, exist_ok = True)
+
 if not os.path.exists(AUTH_FAILURES):
     with open(AUTH_FAILURES, 'w') as file:
         json.dump({}, file)
+
 if not os.path.exists(BLOCKED_IP):
     with open(BLOCKED_IP, 'w') as file:
         json.dump({}, file)
+
 if not os.path.exists(BLOCKED_PASSWORDS):
     with open(BLOCKED_PASSWORDS, 'w') as file:
         json.dump([], file)
+
 if not os.path.exists(ROLES):
     with open(ROLES, 'w') as file:
         json.dump({}, file)
+
 if not os.path.exists(USERS):
     with open(USERS, 'w') as file:
         json.dump({}, file)
 
-# Serialise read/write operations on json files to mitigate race conditions
+# Serialise json read/write operations
 auth_failures_file_lock = threading.Lock()
 blocked_ip_file_lock = threading.Lock()
 blocked_passwords_file_lock = threading.Lock()
 roles_file_lock = threading.Lock()
 users_file_lock = threading.Lock()
 
-# Initialise user role permissions
+# Initialise role permissions
 roles = {}
 with roles_file_lock:
     try:
         with open(ROLES, "r") as file:
             roles = json.load(file)
-
     except Exception as e:
         log.error(f"Roles file error: Failed to read from file. {e}.")
 
+
+# --------------------------------------------------------------------------- #
+# Certificate Signing Request (CSR) service
+# --------------------------------------------------------------------------- #
+
 def csr_connection(
-        conn: socket.socket, client_addr: tuple[str, int], ca_key: object) -> None:
+        conn: socket.socket, 
+        client_addr: tuple[str, int], 
+        ca_key: object
+    ) -> None:
     """
-    This function receives CSR connections with clients and returns a certificate valid for 365 
-    days.
+    Receives CSR connections with clients and returns a certificate valid for 365 days.
     
     Args:        
         conn: A socket connection object enabling binary transfer.
@@ -92,7 +111,6 @@ def csr_connection(
 
         ca_key: A private key object containing the CA key.
     """
-
     # Initialise the csr path variable to mitigate exception errors
     csr_path = None
     client_ip = client_addr[0]
@@ -135,12 +153,10 @@ def csr_connection(
         ).hexdigest()
 
         if not hmac.compare_digest(client_hmac, server_hmac):
-            log.warning(f"CSR error: Incorrect host code received from {client_addr}.")
-            
+            log.warning(f"CSR error: Incorrect server code received from {client_addr}.")
             # Record authentication failure
             client_ip = client_addr[0]
             register_auth_failure(client_ip)
-            
             return
 
         log.info(f"Client {client_addr} CSR authenctication successful.")
@@ -164,7 +180,6 @@ def csr_connection(
 
         # Initialise the client IP address as a variable that can be used for file naming
         client_ip = client_addr[0].replace(".","")
-
         csr_path = os.path.join(CERTIFICATES, f"{client_ip}_csr.pem")
         
         with open(csr_path, "wb") as file:
@@ -179,7 +194,6 @@ def csr_connection(
         try:
             with open(ca_certificate_path, "rb") as file:
                 ca_certificate_bytes = file.read()
-
         except Exception as e:
             log.error(f"CSR error: Unable to read CA certificate. {e}.")
             return
@@ -187,7 +201,6 @@ def csr_connection(
         try:
             with open(signed_certificate_path, "rb") as file:
                 signed_certificate_bytes = file.read()
-
         except Exception as e:
             log.error(
                 f"CSR error: Unable to read client certificate for client {username} {client_addr}."
@@ -195,7 +208,6 @@ def csr_connection(
             return   
         
         conn.sendall(ca_certificate_bytes + TERMINATOR + signed_certificate_bytes)
-
         log.info(f"CA and client certificates sent to client {username} {client_addr}.")
 
     except Exception as e:
@@ -204,21 +216,20 @@ def csr_connection(
     finally:
         try:
             conn.close()
-        
         except Exception:
             pass
 
         if csr_path and os.path.exists(csr_path):
             try:
                 os.remove(csr_path)
-
             except Exception:
                 pass
 
+
 def csr_decryption(attempts: int = 3) -> tuple[str, object, object]:
     """
-    This function obtains the PKI password from the server user, and verifies that this password 
-    correctly decrypts the CA and server keys.
+    Obtains the PKI password from the server user, and verifies that this password correctly 
+    decrypts the CA and server keys.
     
     Args:
         attempts: An int containing the number of attempts a server user has to provide the correct
@@ -229,7 +240,6 @@ def csr_decryption(attempts: int = 3) -> tuple[str, object, object]:
         user as a string, the CA key as a private key object and the server key as a private key 
         object.
     """
-    
     ca_key_path = os.path.join(CERTIFICATES, "ca_key.pem")
     server_key_path = os.path.join(CERTIFICATES,"server_key.pem")
 
@@ -237,7 +247,6 @@ def csr_decryption(attempts: int = 3) -> tuple[str, object, object]:
     try:
         with open(ca_key_path, "rb") as file:
             ca_key_data = file.read()
-
     except OSError as e:
         log.error(f"CSR error: Unable to read {ca_key_path}. {e}.")
         sys.exit(1)
@@ -246,7 +255,6 @@ def csr_decryption(attempts: int = 3) -> tuple[str, object, object]:
     try:
         with open(server_key_path, "rb") as file:
             server_key_data = file.read()
-
     except OSError as e:
         log.error(f"CSR error: Unable to read {server_key_path}. {e}.")
         sys.exit(1)
@@ -261,30 +269,27 @@ def csr_decryption(attempts: int = 3) -> tuple[str, object, object]:
                 ca_key_data,
                 password = password.encode() if password else None
             )
-
             server_key = serialization.load_pem_private_key(
                 server_key_data,
                 password = password.encode() if password else None
             )
-            
             return password, ca_key, server_key
         
         except (ValueError, TypeError):
             log.error("Credential error: Incorrect PKI decryption password.")
 
-
     log.error("Credential error: Too many failed authentication attempts.")   
     sys.exit(1)
 
+
 def csr_listen(ca_key: object) -> None:
     """
-    This function listens for Certificate Signing Request (CSR) connections sent by clients, using 
-    the threading module for parallel processing of handler threads.
+    Listens for Certificate Signing Request (CSR) connections sent by clients, using the threading 
+    module for parallel processing of handler threads.
     
     Args:
         ca_key: A private key object containing the CA key.
     """
-
     # Configure socket connections
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         # Account for server crash/resart by enabling reuse of socket addresses 
@@ -295,7 +300,6 @@ def csr_listen(ca_key: object) -> None:
             sock.listen(5)
             # Log initiation of CSR listening service
             log.info(f"CSR service listening on {HOST}:{CSR_PORT}.")
-
         except Exception as e:
             log.critical(f"CSR error: Port {CSR_PORT} binding failure. {e}.")
             sys.exit(1)
@@ -306,13 +310,11 @@ def csr_listen(ca_key: object) -> None:
         while True:
             try:
                 conn, client_addr = sock.accept()
-            
             except Exception as e:
                 log.error(f"CSR error: Connection with failure with client {client_addr}. {e}.")
                 continue
             
             log.info(f"CSR service connection success with client {client_addr}.")
-
             conn.settimeout(120)
 
             threading.Thread(
@@ -321,10 +323,11 @@ def csr_listen(ca_key: object) -> None:
                 daemon = True
             ).start()
 
+
 def csr_sign(csr_path: str, client_addr: tuple[str, int], ca_key: object) -> tuple[str,str]:
     """
-    This function signs a CSR using the Certificate Authority (CA) certificate and Private Key, and 
-    returns the new certificate filepath.
+    Signs a CSR using the Certificate Authority (CA) certificate and Private Key, and returns the 
+    new certificate filepath.
         
     Args:
         csr_path: A string containing the file path for the client's CSR.
@@ -337,7 +340,6 @@ def csr_sign(csr_path: str, client_addr: tuple[str, int], ca_key: object) -> tup
         A tuple containing the file path for the signed client certificate as a string and the 
         username input by the client user as a string.
     """
-    
     # Define the CA key and certificate filepaths
     ca_certificate_path = os.path.join(CERTIFICATES, "ca_certificate.pem")
 
@@ -345,7 +347,6 @@ def csr_sign(csr_path: str, client_addr: tuple[str, int], ca_key: object) -> tup
         # Initialise the CA certificate as a local variable
         with open(ca_certificate_path, "rb") as file:
             ca_certificate = x509.load_pem_x509_certificate(file.read())
-
     except Exception as e:
         log.error(f"Credential error: Failed to initialise CA certificate. {e}.")
         sys.exit(1)
@@ -358,7 +359,6 @@ def csr_sign(csr_path: str, client_addr: tuple[str, int], ca_key: object) -> tup
             csr = x509.load_pem_x509_csr(file.read())
 
         username = csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-
     except Exception as e:
         log.error(f"Credential error: Failed to initialise client {client_addr} CSR. {e}.")
         return "csr_failure", "csr_failure"
@@ -429,10 +429,16 @@ def csr_sign(csr_path: str, client_addr: tuple[str, int], ca_key: object) -> tup
 
     except Exception as e:
         log.error(f"CSR error: Failed to write client {username} {client_addr} certificate. {e}.")
+        return "csr_failed", "csr_failed"
+
+
+# --------------------------------------------------------------------------- #
+# Authentication & authorisation helpers
+# --------------------------------------------------------------------------- #
 
 def evaluate_ip(ip: str) -> bool:
     """
-    This function evaluates whether a connecting client IP address is currently blocked.
+    Evaluates whether a connecting client IP address is currently blocked.
 
     Args:
         ip: A string containing the IP address of a connecting client.
@@ -440,10 +446,8 @@ def evaluate_ip(ip: str) -> bool:
     Returns:
         A bool containing False if the client IP address is not currently blocked, else True.
     """
-
     timestamp = datetime.now(timezone.utc).timestamp()
     blocked = read_blocked_ip()
-
     blocked_expiry = blocked.get(ip)
     
     # Return False for IP addresses not in the blocked dictionary
@@ -460,15 +464,15 @@ def evaluate_ip(ip: str) -> bool:
     log.info(f"Client {ip} block expired and removed from blocked_ip.json")
     return False
 
+
 def read_auth_failures() -> dict:
     """
-    This function initialises the content of the auth_failures.json file as a dictionary, mapping 
-    client IP addresses to a list of failed authentication timestamps.
+    Initialises the content of the auth_failures.json file as a dictionary, mapping client IP 
+    addresses to a list of failed authentication timestamps.
         
     Returns:
         A dictionary containing the details of all client users.
     """
-
     with auth_failures_file_lock:
         try:
             if not os.path.exists(AUTH_FAILURES) or os.path.getsize(AUTH_FAILURES) == 0:
@@ -481,15 +485,15 @@ def read_auth_failures() -> dict:
             log.error(f"Authorisation failures file error: Failed to read from file. {e}.")
             return {}
 
+
 def read_blocked_ip() -> dict:
     """
-    This function initialises the content of the blocked_ip.json file as a dictionary, mapping 
-    client IP addresses to a timestamp of when the IP block will expire.
+    Initialises the content of the blocked_ip.json file as a dictionary, mapping client IP addresses
+    to a timestamp of when the IP block will expire.
         
     Returns:
         A dictionary containing the details of all client users.
     """
-
     with blocked_ip_file_lock:
         try:
             if not os.path.exists(BLOCKED_IP) or os.path.getsize(BLOCKED_IP) == 0:
@@ -502,15 +506,15 @@ def read_blocked_ip() -> dict:
             log.error(f"Blocked IP file error: Failed to read from file. {e}.")
             return {}
 
+
 def read_blocked_passwords() -> list[str]:
     """
-    This function initialises the content of the blocked_ip.json file as a dictionary, mapping 
-    client IP addresses to a timestamp of when the IP block will expire.
+    Initialises the content of the blocked_ip.json file as a dictionary, mapping client IP addresses
+    to a timestamp of when the IP block will expire.
         
     Returns:
         A list containing blocked passwords as strings.
     """
-
     with blocked_passwords_file_lock:
         try:
             if not os.path.exists(BLOCKED_PASSWORDS) or os.path.getsize(BLOCKED_PASSWORDS) == 0:
@@ -523,15 +527,15 @@ def read_blocked_passwords() -> list[str]:
             log.error(f"Blocked passwords file error: Failed to read from file. {e}.")
             return []
 
+
 def read_users() -> dict:
     """
-    This function initialises the content of the users.json file as a dictionary, mapping client 
-    usernames to user metadata.
+    Initialises the content of the users.json file as a dictionary, mapping client usernames to user
+    metadata.
         
     Returns:
         A dictionary containing the details of all client users.
     """
-
     with users_file_lock:
         try:
             if not os.path.exists(USERS) or os.path.getsize(USERS) == 0:
@@ -544,18 +548,17 @@ def read_users() -> dict:
             log.error(f"Users file error: Failed to read from file. {e}.")
             return {}
 
+
 def register_auth_failure(ip: str) -> None:
     """
-    This function registers the IP address of a client that failed an authentication. If the 
-    quantitiy authentication failures exceeds three within the BLOCK_WINDOW global variable, the 
-    client IP address is added to the blocked_ip.json for the BLOCK_DURATION global variable.
+    Registers the IP address of a client that failed an authentication. If the quantity 
+    authentication failures exceeds three within the BLOCK_WINDOW global variable, the client IP 
+    address is added to the blocked_ip.json for the BLOCK_DURATION global variable.
 
     Args:
         ip: A string containing a client IP address that failed an authentication.
     """
-
     timestamp = datetime.now(timezone.utc).timestamp()
-
     failures = read_auth_failures()
     ip_failures = failures.get(ip, [])
 
@@ -577,11 +580,14 @@ def register_auth_failure(ip: str) -> None:
             f"{BLOCK_DURATION}"
         )
 
+
 def sfts_authenticate(
-        ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int]) -> tuple[bool, str, str]:
+        ssl_conn: ssl.SSLSocket, 
+        client_addr: tuple[str, int]
+    ) -> tuple[bool, str, str]:
     """
-    This function authenticates the received client user credentials against the values stored in 
-    the server's users.json file.
+    Authenticates the received client user credentials against the values stored in the users.json
+    file.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
@@ -594,7 +600,6 @@ def sfts_authenticate(
         the user in the users.json file. Users not listed in the users.json file are assigned the 
         default 'unregistered' role title.
     """
-
     try:
         # Send 256 bit nonce to client
         nonce = os.urandom(32)        
@@ -702,11 +707,19 @@ def sfts_authenticate(
         log.error(f"SFTS error: Authentication failure for {client_addr}. {e}.")
         return False, "unknown", "unregistered"
 
+
+# --------------------------------------------------------------------------- #
+# SFTS command handlers
+# --------------------------------------------------------------------------- #
+
 def sfts_cmd_delete(
-        ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username: str, 
-        filename: str) -> None:
+        ssl_conn: ssl.SSLSocket, 
+        client_addr: tuple[str, int], 
+        username: str, 
+        filename: str
+    ) -> None:
     """
-    This function deletes a file from the host server directory.
+    Deletes a file from the server directory.
     
     Args:    
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
@@ -717,7 +730,6 @@ def sfts_cmd_delete(
 
         filename: A string containing the filename specified by the client user.
     """
-
     log.info(f"Client {username} {client_addr} initiated the delete command.")
 
     # Validate filename
@@ -749,11 +761,16 @@ def sfts_cmd_delete(
         msg = f"Error: Unable to delete {filename}.".encode() + TERMINATOR
         ssl_conn.sendall(msg)
 
+
 def sfts_cmd_download(
-        ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], server_key: object, username: str, 
-        filename: str) -> None:
+        ssl_conn: ssl.SSLSocket, 
+        client_addr: tuple[str, int], 
+        server_key: object, 
+        username: str, 
+        filename: str
+    ) -> None:
     """
-    This function downloads a file from the host server directory to the client directory.
+    Downloads a file from the server's directory to the client directory.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
@@ -766,7 +783,6 @@ def sfts_cmd_download(
 
         filename: A string containing the filename specified by the client user.
     """
-
     log.info(f"Client {username} {client_addr} initiated the download command.")
 
     # Validate filename
@@ -847,13 +863,13 @@ def sfts_cmd_download(
         
         try:
             ssl_conn.sendall(json.dumps(msg).encode() + TERMINATOR)
-
         except Exception:
             pass
 
+
 def sfts_cmd_ls(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username: str) -> None:
     """
-    This function lists file in the host server directory.
+    Lists directories and files in the server's directory.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
@@ -862,7 +878,6 @@ def sfts_cmd_ls(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username:
 
         username: A string containing the username received from the client user.
     """
-
     log.info(f"Client {username} {client_addr} initiated the list command.")
 
     try:
@@ -875,20 +890,19 @@ def sfts_cmd_ls(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username:
         log.info(f"Client {username} {client_addr} listing success {file_list}.")
 
     except Exception as e:
-        error_msg = b"Uable to list host server directory\n" + TERMINATOR
+        error_msg = b"Uable to list server directory\n" + TERMINATOR
         try:
             ssl_conn.sendall(error_msg)
-
         except Exception:
             pass
 
         log.error(f"Command error: Client {username} {client_addr} list failure. {e}.")
 
+
 def sfts_cmd_update(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], username: str) -> None:
     """
-    This function enables a client user to update the password used to authenticate with the SFTS 
-    service but confirming their existing password hash and registering a new password has with
-    the host server.
+    Enables a client user to update the password used to authenticate with the SFTS service by 
+    confirming and replacing their existing password hash.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
@@ -897,27 +911,27 @@ def sfts_cmd_update(ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], usern
 
         username: A string containing the username received from the client user.
     """
-
     log.info(f"Client {username} {client_addr} initiated the update command.")
 
+
 def sfts_cmd_upload(
-        ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], server_key: object, username: str, 
-        filename: str) -> None:
+        ssl_conn: ssl.SSLSocket, 
+        client_addr: tuple[str, int], 
+        username: str, 
+        filename: str
+    ) -> None:
     """
-    This function uploads a file from the client directory to the host server directory.
+    Uploads a file from the client directory to the server directory.
     
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
     
         client_addr: A tuple containing the client's IP address as a string and port as an int.
-
-        server_key: A private key object containing the server's private key.
 
         username: A string containing the username received from the client user.
 
         filename: A string containing the filename specified by the client user.
     """
-
     log.info(f"Client {username} {client_addr} initiated the upload command.")
 
     if not filename:
@@ -928,10 +942,8 @@ def sfts_cmd_upload(
 
         try:
             ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
-
         except Exception:
             pass
-
         return
 
     filepath = os.path.join(DIRECTORY, filename)
@@ -945,10 +957,8 @@ def sfts_cmd_upload(
 
         try:
             ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
-
         except Exception:
             pass
-
         return
 
     # Receive JSON header from client (filesize limit of 64KB)
@@ -968,14 +978,12 @@ def sfts_cmd_upload(
             if len(buffer) > max_bytes:
                 log.error(f"Command error: Invalid header size received from client {username}"
                           f"{client_addr}.")
-
                 return
 
     except Exception as e:
         response = {"status": "error", "message": "Command error: Header not received."} 
         try:
             ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
-
         except Exception:
             pass
 
@@ -987,17 +995,13 @@ def sfts_cmd_upload(
     # Decode JSON header
     try:
         header = json.loads(header_bytes.decode("utf-8"))
-
     except json.JSONDecodeError:
         log.error(f"Command error: Unable to decode JSON header.")
-
         response = {"status": "error", "message": "Command error: Invalid header."} 
         try:
             ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
-
         except Exception:
             pass
-
         return
 
     # Initialise JSON header contents
@@ -1008,17 +1012,13 @@ def sfts_cmd_upload(
         file_hash = header["file_hash"]
         timestamp = header["timestamp"]
         signature = header["signature"]
-
     except KeyError as e:
         log.error(f"Command error: Missing upload command header contents. {e}")
-
         response = {"status": "error", "message": "Command error: Incomplete header."} 
         try:
             ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
-
         except Exception:
             pass
-
         return
 
     # Validate JSON header filename
@@ -1027,10 +1027,8 @@ def sfts_cmd_upload(
         response = {"status": "error", "message": "Command error: Filename mismatch."} 
         try:
             ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
-
         except Exception:
             pass
-
         return
 
     # Validate JSON header hash algorithm
@@ -1039,10 +1037,8 @@ def sfts_cmd_upload(
         response = {"status": "error", "message": "Command error: Unrecognised hash algorithm."} 
         try:
             ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
-
         except Exception:
             pass
-
         return
 
     # Extract and initilaise the client public key from the client certificate
@@ -1052,16 +1048,13 @@ def sfts_cmd_upload(
             raise ValueError("Client certificate couldn't be initialised")
         client_certificate = x509.load_der_x509_certificate(der_certificate)
         client_public_key = client_certificate.public_key()
-
     except Exception as e:
         log.error(f"Signature error: Client private key couldn't be initialised. {e}.")
         response = {"status": "error", "message": "Command error: Client public key error."} 
         try:
             ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
-
         except Exception:
             pass
-
         return
 
     # Validate signature
@@ -1077,13 +1070,12 @@ def sfts_cmd_upload(
             ),
             hashes.SHA256()
         )
-
         log.info(f"Signature validated for {filename} from Client {username} {client_addr}.")
-
     except Exception as e:
         log.error(f"Signature error: Unable to validate signature for {filename} from Client"
                   f"{username} {client_addr}.")
         response = {"status": "error", "message": "Command error: Unable to validate signature."} 
+        
         try:
             ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
 
@@ -1095,19 +1087,15 @@ def sfts_cmd_upload(
                 if not chunk:
                     break
                 remaining -= len(chunk)
-
         except Exception:
             pass
-
         return
 
-    # Receive file from host server while incrementally 
     server_hash = hashlib.sha256()
     remaining = filesize
 
     try:
         with open(filepath, "wb") as file:
-            
             # Account for body bytes delivered with header
             if remainder:
                 file.write(remainder)
@@ -1120,6 +1108,7 @@ def sfts_cmd_upload(
                     log.error(f"Command error: Connection with client {username} {client_addr} lost"
                               "during download")
                     raise ConnectionError(f"Connection lost during download")
+                
                 file.write(chunk)
                 server_hash.update(chunk)
                 remaining -= len(chunk)
@@ -1131,21 +1120,17 @@ def sfts_cmd_upload(
         try:
             if os.path.exists(filepath):
                 os.remove(filepath)
-
         except Exception:
             pass
 
         response = {"status": "error", "message": "Command error: Connection failure mid upload."} 
         try:
             ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
-
         except Exception:
             pass
-
         return
 
-    # Verify upload file integrity using client provided hash and host server generated hash
-    server_hash.hexdigest()
+    # Verify file integrity
     if server_hash.hexdigest() != file_hash:
         log.error(f"Command error: {filename} failed hash verification.")
 
@@ -1153,35 +1138,39 @@ def sfts_cmd_upload(
         try:
             if os.path.exists(filepath):
                 os.remove(filepath)
-
         except Exception:
             pass
 
         response = {"status": "error", "message": "Command error: Hash verification failure."} 
         try:
             ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
-
         except Exception:
             pass
-
         return
 
     response = {"status": "success", "message": f"{filename} upload successful."} 
     try:
         ssl_conn.sendall(json.dumps(response).encode("utf-8") + TERMINATOR)
-
     except Exception:
         log.error(f"Command error: Failed to send success message to client {username}"
-                  f"{client_addr}.")
+                  f" {client_addr}.")
 
     log.info(f"{filename} upload and integrity verification successful.")
 
+
+# --------------------------------------------------------------------------- #
+# Secure File Transfer System (SFTS) service
+# --------------------------------------------------------------------------- #
+
 def sfts_connection(
-        conn: socket.socket, client_addr: tuple[str, int], password: str, 
-        server_key: object) -> None:
+        conn: socket.socket, 
+        client_addr: tuple[str, int], 
+        password: str, 
+        server_key: object
+    ) -> None:
     """
-    This function establishes mutually authenticated TLS connections with clients and then calls
-    authentication, authorisation and SFTS operation functions.
+    Establishes mutually authenticated TLS connections with clients and then calls authentication, 
+    authorisation and SFTS operation functions.
 
     Args:
         conn: A socket connection object enabling binary transfer.
@@ -1193,7 +1182,6 @@ def sfts_connection(
 
         server_key: A private key object containing the server's private key.
     """
-    
     # Initialise placeholder client address to prevent exception reporting errors
     username = "unknown"
     client_ip = client_addr[0]
@@ -1210,7 +1198,7 @@ def sfts_connection(
 
             # Authenticate client
             user_authentication, username, user_role = sfts_authenticate(ssl_conn, client_addr)
-            
+
             # Disconnect from clients that failed authentication
             if not user_authentication:
                 log.warning(f"Authentication error: Client {username} {client_addr} failure.")
@@ -1222,24 +1210,20 @@ def sfts_connection(
     # Common error handling
     except ssl.SSLError as _:
         log.error(f"SFTS error: Client {client_addr} SSL/TLS error. {_}.")
-
     except Exception as e:
         log.error(f"SFTS error: Client {client_addr} connection failure. {e}.")
-
     finally:
         try:
             conn.close()
-        
         except Exception as e:
             log.error(f"SFTS error: Client {username} {client_addr} connection error. {e}.")
             pass
-        
         log.info(f"Connection with client {username} {client_addr} closed")
+
 
 def sfts_context(password: str) -> ssl.SSLContext:
     """
-    This function creates a hardened SSL context using TLS 1.2 and Public Key Infrastructure 
-    (PKI).
+    Creates a hardened SSL context using TLS 1.2 and Public Key Infrastructure (PKI).
     
     Args:
         password: A string containing the password used to decrypt the CA and server keys as input 
@@ -1248,7 +1232,6 @@ def sfts_context(password: str) -> ssl.SSLContext:
     Returns:
         A SSL object containing the CA, server certificate and private key.
     """
-
     try:
         # Default to newest TLS version
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1275,10 +1258,11 @@ def sfts_context(password: str) -> ssl.SSLContext:
         log.critical(f"Fatal error: SSL context initialisation failure. {e}.")
         sys.exit(1)
 
+
 def sfts_listen(password: str, server_key: object) -> None:
     """
-    This function listens for Transport Layer Security (TLS) connections sent by clients, using the 
-    threading module for parallel processing of handler threads.
+    Listens for Transport Layer Security (TLS) connections sent by clients, using the threading
+    module for parallel processing of handler threads.
     
     Args:
         password: A string containing the password used to decrypt the CA and server keys as input 
@@ -1286,7 +1270,6 @@ def sfts_listen(password: str, server_key: object) -> None:
 
         server_key: A private key object containing the server's private key.
     """
-
     # Configure socket connections
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         # Mitigate server crashes and restarts by enabling reuse of socket addresses 
@@ -1296,7 +1279,6 @@ def sfts_listen(password: str, server_key: object) -> None:
             sock.bind((HOST, SFTS_PORT))
             sock.listen(5)
             log.info(f"SFTS service listening on {HOST}:{SFTS_PORT}.")
-
         except Exception as e:
             log.critical(f"SFTS error: Failed to bind SFTS service to port {SFTS_PORT}. {e}.")
             sys.exit(1)
@@ -1307,13 +1289,11 @@ def sfts_listen(password: str, server_key: object) -> None:
         while True:
             try:
                 conn, client_addr = sock.accept()
-            
             except Exception as e:
                 log.error(f"SFTS error: Connection with failure with client {client_addr}. {e}.")
                 continue
             
             log.info(f"SFTS service connection success with client {client_addr}.")
-
             conn.settimeout(120)
 
             threading.Thread(
@@ -1322,13 +1302,17 @@ def sfts_listen(password: str, server_key: object) -> None:
                 daemon = True
             ).start()
 
-def sfts_operations(
-        ssl_conn: ssl.SSLSocket, client_addr: tuple[str, int], server_key: object, username: str, 
-        user_role: str) -> None:
 
+def sfts_operations(
+        ssl_conn: ssl.SSLSocket, 
+        client_addr: tuple[str, int], 
+        server_key: object, 
+        username: str, 
+        user_role: str
+    ) -> None:
     """
-    This function manages SSL connections with clients, incorporating function calls for client 
-    initiated commands.
+    Manages SSL connections with clients, incorporating function calls for client initiated 
+    commands.
 
     Args:
         ssl_conn: A SSL-wrapped socket connection object enabling binary transfer.
@@ -1341,11 +1325,9 @@ def sfts_operations(
         
         user_role: A string containing the client user's role as listed in the users.json file.
     """
-
     log.info(f"Client {username} {client_addr} initiated SFTS operations.")
 
     while True:
-
         # Receive command from client
         cmd_bytes = b""
         while b"\n" not in cmd_bytes:
@@ -1366,13 +1348,11 @@ def sfts_operations(
         header_line, remainder = cmd_bytes.split(b"\n",1)
         cmd, filename, timestamp = header_line.decode().strip().split("|",maxsplit = 2)   
 
-
-# Initialise command variables
+        # Initialise command variables
         try:
             cmd = cmd.lower().strip()
             filename = filename.lower().strip()
             timestamp = datetime.fromisoformat(timestamp)
-
         except Exception as e:
             log.error(f"Command error: Client {username} {client_addr} sent incorrect command data"
                       f" type. {e}.")
@@ -1392,7 +1372,6 @@ def sfts_operations(
         # Validate that the filename doesn't contain indicators of a directory traversal attack
         try:
             filename = traversal_prevention(filename)
-        
         except ValueError:
             log.error(f"Command error: Potential directory traversal attempt from client {username}"
                       f"{client_addr}.")
@@ -1416,16 +1395,21 @@ def sfts_operations(
             sfts_cmd_update(ssl_conn, client_addr, username)
 
         elif cmd == "upload":
-            sfts_cmd_upload(ssl_conn, client_addr, server_key, username, filename)
+            sfts_cmd_upload(ssl_conn, client_addr, username, filename)
 
         else:
             log.error(
                 f"Command error: Client {username} {client_addr} sent unrecognised command {cmd}.")
 
+
+# --------------------------------------------------------------------------- #
+# Misc helpers
+# --------------------------------------------------------------------------- #
+
 def timestamp_validation(timestamp: object, client_addr: tuple[str, int], username: str) -> bool:
     """
-    This function mitigates against replay attacks by calculating the difference between timestamps 
-    embedded in client communication and timestamps generated by the server.
+    Mitigates against replay attacks by calculating the difference between timestamps embedded in 
+    client communication and timestamps generated by the server.
     
     Args:
         timestamp: An object containing the date and time in UTC +0:00, identifying when the 
@@ -1439,7 +1423,6 @@ def timestamp_validation(timestamp: object, client_addr: tuple[str, int], userna
         A Bool containing True if the age of the recieved timestamp is less than the DELAY_TOLERANCE 
         global variable, else False.
     """
-    
     try:
         delay = datetime.now(timezone.utc) - timestamp
     
@@ -1449,15 +1432,16 @@ def timestamp_validation(timestamp: object, client_addr: tuple[str, int], userna
         log.error(
             f"Timestamp error: Client {username} {client_addr} timestamp exceeds delay tolerance.")
         return False   
-    
+
     except Exception as e:
         log.error(f"Timestamp error: Client {username} {client_addr} validation failure. {e}.")
         return False
 
+
 def traversal_prevention(filename: str) -> str:
     """
-    This function evaluates a string containing a filename received from a client users and raises a
-    ValueError if that filename contains indicators of a directory traversal attempt.
+    Evaluates a string containing a filename received from a client users and raises a value error 
+    if that filename contains indicators of a directory traversal attempt.
 
     Args:
         filename: A string containing the filename specified by the client user.
@@ -1465,7 +1449,6 @@ def traversal_prevention(filename: str) -> str:
     Returns:
         A filename that doesn't contain ascii characters used for directory traversal as a string.
     """
-
     # Remove whitespaces from filenames
     filename = filename.strip()
 
@@ -1486,57 +1469,59 @@ def traversal_prevention(filename: str) -> str:
 
     return valid_filename
 
+
 def write_auth_failures(auth_failures: dict) -> None:
     """
-    This function writes a dictionary to the auth_failures.json file.
+    Writes a dictionary to the auth_failures.json file.
         
     Args:
         auth_failures: A dictionary containing the timestamps of client authentication failures.
     """
-
     with auth_failures_file_lock:
         try:
             with open(AUTH_FAILURES, "w") as file:
                 json.dump(auth_failures, file, indent = 4)
-
         except Exception as e:
             log.error(f"Authorisation failures file error: Failed to write file. {e}.")
             return
 
+
 def write_blocked_ip(blocked_ip: dict) -> None:
     """
-    This function writes a dictionary to the users.json file.
+    Writes a dictionary to the blocked_ip.json file.
         
     Args:
         blocked_ip: A dictionary containing the timestamp of when the blocks on client IP 
         addresses will expire.
     """
-
     with blocked_ip_file_lock:
         try:
             with open(BLOCKED_IP, "w") as file:
                 json.dump(blocked_ip, file, indent = 4)
-
         except Exception as e:
             log.error(f"Blocked IP file error: Failed to write file. {e}.")
             return
 
+
 def write_users(users: dict) -> None:
     """
-    This function writes a dictionary to the users.json file.
+    Writes a dictionary to the users.json file.
         
     Args:
         users: A dictionary containing the details of all client users.
     """
-
     with users_file_lock:
         try:
             with open(USERS, "w") as file:
                 json.dump(users, file, indent = 4)
-
         except Exception as e:
             log.error(f"Users file error: Failed to write file. {e}.")
             return
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
 
 def main() -> None:
     print("---------------------------------------------------------------------------------\n")
@@ -1561,10 +1546,8 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-
     except KeyboardInterrupt:
         log.info("Server shutdown by keyboard interrupt.")
-
     except Exception as e:
         log.critical(f"Fatal error: {e}.")
         sys.exit(1)
